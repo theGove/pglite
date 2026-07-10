@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PGlite Studio</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.2/dist/xlsx.full.min.js" defer></script>
+  <script src="app.js" defer></script>
+
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">▤</span>
+      <span class="brand-name">WebSQL.org</span>
+    </div>
+
+    <div class="toolbar">
+      <button id="btn-run" class="btn btn-primary" title="Run query (Ctrl/Cmd+Enter)">
+        <span class="icon">▶</span> Run
+      </button>
+      <span class="divider"></span>
+      <div class="menu" id="menu">
+        <button id="btn-menu" class="btn icon-btn-lg" title="Database actions" aria-haspopup="true" aria-expanded="false">☰</button>
+        <div id="menu-panel" class="menu-panel" hidden>
+          <button class="menu-item" id="menu-upload">
+            <span class="icon">⭱</span> Upload Data(base)
+          </button>
+          <button class="menu-item" id="menu-download">
+            <span class="icon">⭳</span> Download Database
+          </button>
+          <button class="menu-item" id="menu-export-excel">
+            <span class="icon">📊</span> Export All Tables to Excel
+          </button>
+          <div class="menu-separator"></div>
+          <button class="menu-item" id="menu-theme">
+            <span class="icon" id="theme-icon">🌙</span> <span id="theme-label">Dark Mode</span>
+          </button>
+          <div class="menu-separator" id="load-data-separator" hidden></div>
+          <div id="load-data-section" hidden>
+            <button class="menu-item" id="menu-load-data" aria-haspopup="true" aria-expanded="false">
+              <span class="icon">⇩</span> Load Data <span class="menu-caret">▸</span>
+            </button>
+            <div class="submenu" id="load-data-submenu" hidden></div>
+          </div>
+          <div class="menu-separator"></div>
+          <button class="menu-item menu-item-danger" id="menu-clear">Clear Data</button>
+        </div>
+      </div>
+      <input id="file-input" type="file" accept=".tar,.tar.gz,.tgz,.sql,.csv,.xlsx,.xlsm,.xls" hidden />
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-title">Tables</span>
+        <div class="sidebar-header-actions">
+          <button id="btn-refresh-tables" class="icon-btn" title="Refresh table list">⟲</button>
+          <button id="btn-toggle-sidebar" class="icon-btn" title="Collapse sidebar">«</button>
+        </div>
+      </div>
+      <div id="table-list" class="table-list">
+        <div class="empty-hint">No tables yet</div>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <div id="editor-pane" class="editor-pane"></div>
+
+      <div class="resizer" id="resizer"></div>
+
+      <div class="results-pane">
+        <div class="results-header">
+          <span id="results-title">Results</span>
+          <span id="results-meta" class="results-meta"></span>
+        </div>
+        <div id="results-body" class="results-body">
+          <div class="empty-hint">Run a query to see results here.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="statusbar" class="statusbar" hidden>
+    <span class="status-left">
+      <span id="loading-indicator" class="loading-indicator" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="loading-label">Loading data…</span>
+      </span>
+      <span id="status-text">Starting database…</span>
+    </span>
+    <span id="db-name" class="db-name"></span>
+  </footer>
+
+  <div id="toast" class="toast" hidden></div>
+
+</body>
+</html>
