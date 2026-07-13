@@ -769,6 +769,8 @@ table.result-table tbody tr:hover {
   width: 100%;
   height: 100%;
   overflow: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
   background:
     linear-gradient(var(--erd-grid) 1px, transparent 1px) 0 0 / 28px 28px,
     linear-gradient(90deg, var(--erd-grid) 1px, transparent 1px) 0 0 / 28px 28px,
@@ -782,7 +784,6 @@ table.result-table tbody tr:hover {
 
 .erd-svg {
   display: block;
-  transform-origin: 0 0;
   max-width: none;
   max-height: none;
 }
@@ -841,10 +842,23 @@ table.result-table tbody tr:hover {
   opacity: 0.85;
 }
 
+.erd-relationship {
+  cursor: pointer;
+}
+
+.erd-line-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  stroke-linecap: round;
+  pointer-events: stroke;
+}
+
 .erd-line {
   stroke: var(--erd-line);
   stroke-width: 2;
   stroke-linecap: butt;
+  pointer-events: none;
 }
 
 .erd-crowsfoot {
@@ -853,4 +867,11 @@ table.result-table tbody tr:hover {
   stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
+  pointer-events: stroke;
+}
+
+.erd-relationship.is-selected .erd-line,
+.erd-relationship.is-selected .erd-crowsfoot {
+  stroke: var(--accent);
+  stroke-width: 3;
 }

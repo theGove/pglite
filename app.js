@@ -36,6 +36,8 @@ let erdPositions = new Map();
 let erdState = null;
 /** @type {{ tableName: string, offsetX: number, offsetY: number, pointerId: number } | null} */
 let erdDrag = null;
+/** @type {number | null} Index of the highlighted ERD relationship, or null. */
+let erdSelectedRelIndex = null;
 let lastResultsHtml = `<div class="empty-hint">Run a query to see results here.</div>`;
 let lastResultsMeta = "";
 let lastResultsClassName = "results-body";
@@ -1358,8 +1360,9 @@ function renderErdNode(node) {
  * Renders a relationship line using crow's foot notation with min/max cardinality.
  * @param {{ fromTable: string, fromColumn: string, toTable: string, toColumn: string, manyKind: string, oneKind: string }} rel
  * @param {Map<string, any>} nodes
+ * @param {number} index - Relationship index used for selection.
  */
-function renderErdRelationship(rel, nodes) {
+function renderErdRelationship(rel, nodes, index) {
   const fromNode = nodes.get(rel.fromTable);
   const toNode = nodes.get(rel.toTable);
   if (!fromNode || !toNode) return "";
@@ -1376,12 +1379,38 @@ function renderErdRelationship(rel, nodes) {
   );
   const manyMarker = renderErdCardinalityMarker(path.fromX, path.fromY, path.fromToward, manyKind);
   const oneMarker = renderErdCardinalityMarker(path.toX, path.toY, path.toToward, oneKind);
+  const selected = erdSelectedRelIndex === index ? " is-selected" : "";
 
-  return `<g class="erd-relationship" data-from="${escapeHtml(rel.fromTable)}" data-to="${escapeHtml(rel.toTable)}">
+  return `<g class="erd-relationship${selected}" data-rel-index="${index}" data-from="${escapeHtml(rel.fromTable)}" data-to="${escapeHtml(rel.toTable)}">
+    <path d="${path.d}" class="erd-line-hit" fill="none"></path>
     <path d="${path.d}" class="erd-line" fill="none"></path>
     ${manyMarker}
     ${oneMarker}
   </g>`;
+}
+
+/**
+ * Highlights a relationship by index, or clears the highlight when null.
+ * @param {number | null} index
+ */
+function selectErdRelationship(index) {
+  erdSelectedRelIndex = index;
+  const group = el.resultsBody.querySelector("#erd-relationships");
+  if (!group) return;
+
+  group.querySelectorAll(".erd-relationship.is-selected").forEach((relEl) => {
+    relEl.classList.remove("is-selected");
+  });
+
+  if (index == null) return;
+
+  const selected = group.querySelector(`.erd-relationship[data-rel-index="${index}"]`);
+  if (!selected) {
+    erdSelectedRelIndex = null;
+    return;
+  }
+  selected.classList.add("is-selected");
+  group.appendChild(selected);
 }
 
 /**
@@ -1431,8 +1460,31 @@ function updateErdRelationships() {
   const group = el.resultsBody.querySelector("#erd-relationships");
   if (!group) return;
   group.innerHTML = erdState.relationships
-    .map((rel) => renderErdRelationship(rel, erdState.nodes))
+    .map((rel, index) => renderErdRelationship(rel, erdState.nodes, index))
     .join("");
+  selectErdRelationship(erdSelectedRelIndex);
+}
+
+/**
+ * Attaches click handlers so relationship lines can be highlighted.
+ */
+function bindErdRelationshipHandlers() {
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  if (!svg || svg.dataset.relClickBound === "1") return;
+  svg.dataset.relClickBound = "1";
+
+  svg.addEventListener("click", (event) => {
+    if (erdDrag) return;
+    const relEl = event.target.closest(".erd-relationship");
+    if (relEl) {
+      const index = Number(relEl.getAttribute("data-rel-index"));
+      if (!Number.isFinite(index)) return;
+      selectErdRelationship(erdSelectedRelIndex === index ? null : index);
+      event.stopPropagation();
+      return;
+    }
+    selectErdRelationship(null);
+  });
 }
 
 /**
@@ -1558,6 +1610,7 @@ async function renderErd() {
   if (!pg) return;
 
   erdDrag = null;
+  erdSelectedRelIndex = null;
   erdState = null;
   el.resultsBody.className = "results-body erd-body";
   el.resultsBody.innerHTML = `<div class="empty-hint">Loading ERD…</div>`;
@@ -1574,7 +1627,7 @@ async function renderErd() {
   erdState = { nodes, relationships: schema.relationships };
 
   const relationshipsSvg = schema.relationships
-    .map((rel) => renderErdRelationship(rel, nodes))
+    .map((rel, index) => renderErdRelationship(rel, nodes, index))
     .join("");
   const nodesSvg = [...nodes.values()].map((node) => renderErdNode(node)).join("");
 
@@ -1591,6 +1644,7 @@ async function renderErd() {
   const relCount = schema.relationships.length;
   el.resultsMeta.textContent = `${schema.tables.length} table(s) · ${relCount} relationship(s)`;
   bindErdDragHandlers();
+  bindErdRelationshipHandlers();
   applyErdZoom();
 }
 
