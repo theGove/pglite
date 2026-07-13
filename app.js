@@ -36,6 +36,10 @@ let erdPositions = new Map();
 let erdState = null;
 /** @type {{ tableName: string, offsetX: number, offsetY: number, pointerId: number } | null} */
 let erdDrag = null;
+/** @type {{ distance: number, zoom: number } | null} Active touch pinch session. */
+let erdPinch = null;
+/** @type {number | null} Zoom at the start of a Safari trackpad gesture. */
+let erdGestureStartZoom = null;
 /** @type {number | null} Index of the highlighted ERD relationship, or null. */
 let erdSelectedRelIndex = null;
 let lastResultsHtml = `<div class="empty-hint">Run a query to see results here.</div>`;
@@ -1595,12 +1599,174 @@ function applyErdZoom() {
 }
 
 /**
- * Changes ERD zoom by a delta and clamps to min/max.
+ * Clamps an ERD zoom factor to the allowed range.
+ * @param {number} zoom
+ */
+function clampErdZoom(zoom) {
+  return Math.min(ERD_ZOOM_MAX, Math.max(ERD_ZOOM_MIN, zoom));
+}
+
+/**
+ * Zooms the ERD toward a viewport point so that point stays under the cursor/fingers.
+ * @param {number} clientX - Focal X in viewport coordinates.
+ * @param {number} clientY - Focal Y in viewport coordinates.
+ * @param {number} nextZoom - Desired zoom factor before clamping.
+ */
+function setErdZoomAt(clientX, clientY, nextZoom) {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!scroll) {
+    erdZoom = clampErdZoom(nextZoom);
+    applyErdZoom();
+    return;
+  }
+
+  const zoom = clampErdZoom(nextZoom);
+  if (zoom === erdZoom) {
+    applyErdZoom();
+    return;
+  }
+
+  const rect = scroll.getBoundingClientRect();
+  const contentX = (clientX - rect.left + scroll.scrollLeft) / erdZoom;
+  const contentY = (clientY - rect.top + scroll.scrollTop) / erdZoom;
+
+  erdZoom = zoom;
+  applyErdZoom();
+
+  scroll.scrollLeft = contentX * erdZoom - (clientX - rect.left);
+  scroll.scrollTop = contentY * erdZoom - (clientY - rect.top);
+}
+
+/**
+ * Changes ERD zoom by a delta and clamps to min/max, centered in the viewport.
  * @param {number} delta
  */
 function changeErdZoom(delta) {
-  erdZoom = Math.min(ERD_ZOOM_MAX, Math.max(ERD_ZOOM_MIN, Math.round((erdZoom + delta) * 10) / 10));
-  applyErdZoom();
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  const nextZoom = Math.round((erdZoom + delta) * 10) / 10;
+  if (!scroll) {
+    erdZoom = clampErdZoom(nextZoom);
+    applyErdZoom();
+    return;
+  }
+  const rect = scroll.getBoundingClientRect();
+  setErdZoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, nextZoom);
+}
+
+/**
+ * Clears any active ERD table drag (used when a pinch starts).
+ */
+function cancelErdDrag() {
+  if (!erdDrag) return;
+  const nodeEl = findErdNodeEl(erdDrag.tableName);
+  if (nodeEl) nodeEl.classList.remove("is-dragging");
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (scroll) scroll.classList.remove("is-dragging");
+  erdDrag = null;
+}
+
+/**
+ * Starts an ERD pinch session from a two-finger touch.
+ * @param {TouchEvent} event
+ */
+function onErdTouchStart(event) {
+  if (event.touches.length !== 2) {
+    if (event.touches.length < 2) erdPinch = null;
+    return;
+  }
+  cancelErdDrag();
+  const a = event.touches[0];
+  const b = event.touches[1];
+  const distance = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+  if (distance < 8) return;
+  erdPinch = { distance, zoom: erdZoom };
+}
+
+/**
+ * Continues an ERD pinch-zoom toward the midpoint between fingers.
+ * @param {TouchEvent} event
+ */
+function onErdTouchMove(event) {
+  if (event.touches.length !== 2 || !erdPinch) return;
+  event.preventDefault();
+  const a = event.touches[0];
+  const b = event.touches[1];
+  const distance = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+  if (distance < 8) return;
+  setErdZoomAt(
+    (a.clientX + b.clientX) / 2,
+    (a.clientY + b.clientY) / 2,
+    erdPinch.zoom * (distance / erdPinch.distance)
+  );
+}
+
+/**
+ * Ends an ERD pinch session when fewer than two fingers remain.
+ * @param {TouchEvent} event
+ */
+function onErdTouchEnd(event) {
+  if (event.touches.length < 2) erdPinch = null;
+}
+
+/**
+ * Zooms the ERD for trackpad pinch (ctrl+wheel) toward the cursor.
+ * @param {WheelEvent} event
+ */
+function onErdWheelZoom(event) {
+  if (!event.ctrlKey && !event.metaKey) return;
+  event.preventDefault();
+  const factor = Math.exp(-event.deltaY * 0.01);
+  setErdZoomAt(event.clientX, event.clientY, erdZoom * factor);
+}
+
+/**
+ * Starts a Safari trackpad pinch gesture.
+ * @param {Event} event
+ */
+function onErdGestureStart(event) {
+  event.preventDefault();
+  erdGestureStartZoom = erdZoom;
+}
+
+/**
+ * Continues a Safari trackpad pinch gesture toward the cursor.
+ * @param {Event & { scale?: number, clientX?: number, clientY?: number }} event
+ */
+function onErdGestureChange(event) {
+  event.preventDefault();
+  if (erdGestureStartZoom == null || typeof event.scale !== "number") return;
+  const clientX = typeof event.clientX === "number" ? event.clientX : 0;
+  const clientY = typeof event.clientY === "number" ? event.clientY : 0;
+  setErdZoomAt(clientX, clientY, erdGestureStartZoom * event.scale);
+}
+
+/**
+ * Ends a Safari trackpad pinch gesture.
+ * @param {Event} event
+ */
+function onErdGestureEnd(event) {
+  event.preventDefault();
+  erdGestureStartZoom = null;
+}
+
+/**
+ * Attaches pinch and trackpad zoom listeners to the ERD scroll container.
+ */
+function bindErdZoomHandlers() {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!scroll) return;
+
+  erdPinch = null;
+  erdGestureStartZoom = null;
+
+  scroll.addEventListener("touchstart", onErdTouchStart, { passive: true });
+  scroll.addEventListener("touchmove", onErdTouchMove, { passive: false });
+  scroll.addEventListener("touchend", onErdTouchEnd);
+  scroll.addEventListener("touchcancel", onErdTouchEnd);
+  scroll.addEventListener("wheel", onErdWheelZoom, { passive: false });
+  scroll.addEventListener("gesturestart", onErdGestureStart);
+  scroll.addEventListener("gesturechange", onErdGestureChange);
+  scroll.addEventListener("gestureend", onErdGestureEnd);
 }
 
 /**
@@ -1610,6 +1776,8 @@ async function renderErd() {
   if (!pg) return;
 
   erdDrag = null;
+  erdPinch = null;
+  erdGestureStartZoom = null;
   erdSelectedRelIndex = null;
   erdState = null;
   el.resultsBody.className = "results-body erd-body";
@@ -1645,6 +1813,7 @@ async function renderErd() {
   el.resultsMeta.textContent = `${schema.tables.length} table(s) · ${relCount} relationship(s)`;
   bindErdDragHandlers();
   bindErdRelationshipHandlers();
+  bindErdZoomHandlers();
   applyErdZoom();
 }
 

@@ -770,6 +770,7 @@ table.result-table tbody tr:hover {
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
+  /* Allow one-finger pan; custom JS handles two-finger pinch zoom. */
   touch-action: pan-x pan-y;
   background:
     linear-gradient(var(--erd-grid) 1px, transparent 1px) 0 0 / 28px 28px,
@@ -784,6 +785,7 @@ table.result-table tbody tr:hover {
 
 .erd-svg {
   display: block;
+  transform-origin: 0 0;
   max-width: none;
   max-height: none;
 }
