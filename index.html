@@ -78,8 +78,17 @@
 
       <div class="results-pane">
         <div class="results-header">
-          <span id="results-title">Results</span>
+          <div class="results-view-tabs" role="tablist" aria-label="Results views">
+            <button id="btn-view-results" class="results-view-tab is-active" role="tab" aria-selected="true">Results</button>
+            <button id="btn-view-erd" class="results-view-tab" role="tab" aria-selected="false">ERD</button>
+          </div>
           <span id="results-meta" class="results-meta"></span>
+          <div id="erd-toolbar" class="erd-toolbar" hidden>
+            <button id="btn-erd-zoom-out" class="icon-btn" title="Zoom out" aria-label="ERD zoom out">−</button>
+            <span id="erd-zoom-label" class="erd-zoom-label">100%</span>
+            <button id="btn-erd-zoom-in" class="icon-btn" title="Zoom in" aria-label="ERD zoom in">+</button>
+            <button id="btn-erd-refresh" class="icon-btn" title="Refresh ERD" aria-label="Refresh ERD">⟲</button>
+          </div>
           <button id="btn-run" class="btn btn-primary results-header-run" title="Run query (Ctrl/Cmd+Enter)">
             <span class="icon">▶</span> Run
           </button>

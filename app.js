@@ -27,6 +27,18 @@ let currentResultSets = [];
 let columnsCache = new Map();
 let dataLoadingDepth = 0;
 let unsubLeaderChange = null;
+/** @type {'results' | 'erd'} */
+let resultsViewMode = "results";
+let erdZoom = 1;
+/** @type {Map<string, { x: number, y: number }>} */
+let erdPositions = new Map();
+/** @type {{ nodes: Map<string, any>, relationships: Array<any> } | null} */
+let erdState = null;
+/** @type {{ tableName: string, offsetX: number, offsetY: number, pointerId: number } | null} */
+let erdDrag = null;
+let lastResultsHtml = `<div class="empty-hint">Run a query to see results here.</div>`;
+let lastResultsMeta = "";
+let lastResultsClassName = "results-body";
 
 // ---- DOM refs -------------------------------------------------------------
 
@@ -55,6 +67,13 @@ const el = {
   tableList: document.getElementById("table-list"),
   resultsBody: document.getElementById("results-body"),
   resultsMeta: document.getElementById("results-meta"),
+  viewResults: document.getElementById("btn-view-results"),
+  viewErd: document.getElementById("btn-view-erd"),
+  erdToolbar: document.getElementById("erd-toolbar"),
+  erdZoomIn: document.getElementById("btn-erd-zoom-in"),
+  erdZoomOut: document.getElementById("btn-erd-zoom-out"),
+  erdZoomLabel: document.getElementById("erd-zoom-label"),
+  erdRefresh: document.getElementById("btn-erd-refresh"),
   statusText: document.getElementById("status-text"),
   loadingIndicator: document.getElementById("loading-indicator"),
   statusBar: document.getElementById("statusbar"),
@@ -529,20 +548,21 @@ async function runQuery() {
 
 function clearResults(message) {
   currentResultSets = [];
-  el.resultsBody.className = "results-body";
-  el.resultsBody.innerHTML = `<div class="empty-hint">${escapeHtml(message)}</div>`;
-  el.resultsMeta.textContent = "";
+  lastResultsHtml = `<div class="empty-hint">${escapeHtml(message)}</div>`;
+  lastResultsMeta = "";
+  lastResultsClassName = "results-body";
+  setResultsView("results");
 }
 
 function renderError(err) {
   currentResultSets = [];
-  el.resultsBody.className = "results-body has-error";
-  el.resultsBody.innerHTML = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
-  el.resultsMeta.textContent = "";
+  lastResultsHtml = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
+  lastResultsMeta = "";
+  lastResultsClassName = "results-body has-error";
+  setResultsView("results");
 }
 
 function renderResults(results, elapsedMs) {
-  el.resultsBody.className = "results-body";
   currentResultSets = results || [];
 
   if (!results || results.length === 0) {
@@ -566,10 +586,11 @@ function renderResults(results, elapsedMs) {
     return `<div class="result-block">${header}<div class="empty-hint">OK — ${affected} row(s) affected.</div></div>`;
   });
 
-  el.resultsBody.innerHTML = blocks.join("");
-
+  lastResultsHtml = blocks.join("");
   const totalRows = results.reduce((sum, r) => sum + (r.rows ? r.rows.length : 0), 0);
-  el.resultsMeta.textContent = `${totalRows} row(s) · ${elapsedMs} ms`;
+  lastResultsMeta = `${totalRows} row(s) · ${elapsedMs} ms`;
+  lastResultsClassName = "results-body";
+  setResultsView("results");
 }
 
 function isNumericValue(value) {
@@ -685,6 +706,10 @@ async function refreshTables() {
     el.tableList.querySelectorAll(".table-toggle").forEach((btn) => {
       btn.addEventListener("click", () => toggleTableColumns(btn));
     });
+
+    if (resultsViewMode === "erd") {
+      renderErd().catch(console.error);
+    }
   } catch (err) {
     console.error(err);
   }
@@ -737,6 +762,529 @@ function renderColumns(container, columns) {
         `<div class="column-item"><span class="column-name">${escapeHtml(c.column_name)}</span><span>${escapeHtml(c.data_type)}</span></div>`
     )
     .join("");
+}
+
+// ---- ERD -------------------------------------------------------------------
+
+const ERD_NODE_WIDTH = 230;
+const ERD_HEADER_HEIGHT = 42;
+const ERD_ROW_HEIGHT = 22;
+const ERD_PAD_X = 48;
+const ERD_PAD_Y = 34;
+const ERD_GAP_X = 70;
+const ERD_GAP_Y = 48;
+const ERD_ZOOM_MIN = 0.5;
+const ERD_ZOOM_MAX = 2;
+const ERD_ZOOM_STEP = 0.1;
+const ERD_MIN_POS = 8;
+
+/**
+ * Switches the bottom pane between query results and the ERD view.
+ * @param {'results' | 'erd'} mode
+ */
+function setResultsView(mode) {
+  resultsViewMode = mode;
+  const showingErd = mode === "erd";
+
+  el.viewResults.classList.toggle("is-active", !showingErd);
+  el.viewErd.classList.toggle("is-active", showingErd);
+  el.viewResults.setAttribute("aria-selected", String(!showingErd));
+  el.viewErd.setAttribute("aria-selected", String(showingErd));
+  el.erdToolbar.hidden = !showingErd;
+
+  if (showingErd) {
+    renderErd().catch((err) => {
+      console.error(err);
+      el.resultsBody.className = "results-body has-error";
+      el.resultsBody.innerHTML = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
+      el.resultsMeta.textContent = "";
+    });
+    return;
+  }
+
+  el.resultsBody.className = lastResultsClassName;
+  el.resultsBody.innerHTML = lastResultsHtml;
+  el.resultsMeta.textContent = lastResultsMeta;
+}
+
+/**
+ * Loads public tables, columns, primary keys, and foreign keys for the ERD.
+ */
+async function fetchErdSchema() {
+  const tablesRes = await pg.query(
+    `select table_name
+     from information_schema.tables
+     where table_schema = 'public' and table_type = 'BASE TABLE'
+     order by table_name;`
+  );
+
+  const columnsRes = await pg.query(
+    `select table_name, column_name, data_type, ordinal_position
+     from information_schema.columns
+     where table_schema = 'public'
+     order by table_name, ordinal_position;`
+  );
+
+  const pkRes = await pg.query(
+    `select kcu.table_name, kcu.column_name
+     from information_schema.table_constraints tc
+     join information_schema.key_column_usage kcu
+       on tc.constraint_schema = kcu.constraint_schema
+      and tc.constraint_name = kcu.constraint_name
+     where tc.constraint_type = 'PRIMARY KEY'
+       and tc.table_schema = 'public';`
+  );
+
+  const fkRes = await pg.query(
+    `select
+       kcu.table_name as from_table,
+       kcu.column_name as from_column,
+       ccu.table_name as to_table,
+       ccu.column_name as to_column
+     from information_schema.table_constraints tc
+     join information_schema.key_column_usage kcu
+       on tc.constraint_schema = kcu.constraint_schema
+      and tc.constraint_name = kcu.constraint_name
+     join information_schema.referential_constraints rc
+       on tc.constraint_schema = rc.constraint_schema
+      and tc.constraint_name = rc.constraint_name
+     join information_schema.constraint_column_usage ccu
+       on rc.unique_constraint_schema = ccu.constraint_schema
+      and rc.unique_constraint_name = ccu.constraint_name
+     where tc.constraint_type = 'FOREIGN KEY'
+       and tc.table_schema = 'public';`
+  );
+
+  const pkSet = new Set(pkRes.rows.map((r) => `${r.table_name}.${r.column_name}`));
+  const fkCols = new Set(fkRes.rows.map((r) => `${r.from_table}.${r.from_column}`));
+
+  /** @type {Map<string, { name: string, columns: Array<{ name: string, type: string, isPk: boolean, isFk: boolean }> }>} */
+  const tables = new Map();
+  for (const row of tablesRes.rows) {
+    tables.set(row.table_name, { name: row.table_name, columns: [] });
+  }
+  for (const row of columnsRes.rows) {
+    const table = tables.get(row.table_name);
+    if (!table) continue;
+    const key = `${row.table_name}.${row.column_name}`;
+    table.columns.push({
+      name: row.column_name,
+      type: formatErdType(row.data_type),
+      isPk: pkSet.has(key),
+      isFk: fkCols.has(key),
+    });
+  }
+
+  return {
+    tables: [...tables.values()],
+    relationships: fkRes.rows.map((r) => ({
+      fromTable: r.from_table,
+      fromColumn: r.from_column,
+      toTable: r.to_table,
+      toColumn: r.to_column,
+    })),
+  };
+}
+
+/**
+ * Shortens PostgreSQL data types for ERD labels.
+ * @param {string} dataType
+ */
+function formatErdType(dataType) {
+  const map = {
+    "character varying": "VARCHAR",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "timestamp without time zone": "TIMESTAMP",
+    "double precision": "FLOAT8",
+    integer: "INT",
+    bigint: "BIGINT",
+    smallint: "SMALLINT",
+    boolean: "BOOL",
+    text: "TEXT",
+    numeric: "NUMERIC",
+    real: "REAL",
+    date: "DATE",
+    uuid: "UUID",
+    json: "JSON",
+    jsonb: "JSONB",
+  };
+  return map[dataType] || String(dataType || "").toUpperCase();
+}
+
+/**
+ * Lays out ERD tables in a wrapping grid and returns node geometry.
+ * Reuses any saved drag positions for tables the user has already moved.
+ * @param {Array<{ name: string, columns: unknown[] }>} tables
+ */
+function layoutErdNodes(tables) {
+  const colsPerRow = Math.max(1, Math.ceil(Math.sqrt(tables.length)));
+  const nodes = new Map();
+  let x = ERD_PAD_X;
+  let y = ERD_PAD_Y;
+  let rowMaxHeight = 0;
+  let col = 0;
+  let maxX = ERD_PAD_X;
+  let maxY = ERD_PAD_Y;
+  const nextPositions = new Map();
+
+  for (const table of tables) {
+    const height = ERD_HEADER_HEIGHT + Math.max(table.columns.length, 1) * ERD_ROW_HEIGHT + 8;
+    const saved = erdPositions.get(table.name);
+    let nodeX = x;
+    let nodeY = y;
+
+    if (saved) {
+      nodeX = saved.x;
+      nodeY = saved.y;
+    } else {
+      if (col >= colsPerRow) {
+        x = ERD_PAD_X;
+        y += rowMaxHeight + ERD_GAP_Y;
+        rowMaxHeight = 0;
+        col = 0;
+      }
+      nodeX = x;
+      nodeY = y;
+      x += ERD_NODE_WIDTH + ERD_GAP_X;
+      col += 1;
+      rowMaxHeight = Math.max(rowMaxHeight, height);
+    }
+
+    nodes.set(table.name, {
+      ...table,
+      x: nodeX,
+      y: nodeY,
+      width: ERD_NODE_WIDTH,
+      height,
+    });
+    nextPositions.set(table.name, { x: nodeX, y: nodeY });
+    maxX = Math.max(maxX, nodeX + ERD_NODE_WIDTH);
+    maxY = Math.max(maxY, nodeY + height);
+  }
+
+  erdPositions = nextPositions;
+
+  return {
+    nodes,
+    width: maxX + ERD_PAD_X,
+    height: maxY + ERD_PAD_Y,
+  };
+}
+
+/**
+ * Returns the vertical center of a column row inside a table node.
+ * @param {{ y: number, columns: Array<{ name: string }> }} node
+ * @param {string} columnName
+ */
+function erdColumnCenterY(node, columnName) {
+  const idx = node.columns.findIndex((c) => c.name === columnName);
+  const row = idx >= 0 ? idx : 0;
+  return node.y + ERD_HEADER_HEIGHT + row * ERD_ROW_HEIGHT + ERD_ROW_HEIGHT / 2;
+}
+
+/**
+ * Builds an SVG path for a relationship between two table sides.
+ * @param {{ x: number, y: number, width: number, height: number, columns: Array<{ name: string }> }} fromNode
+ * @param {string} fromColumn
+ * @param {{ x: number, y: number, width: number, height: number, columns: Array<{ name: string }> }} toNode
+ * @param {string} toColumn
+ */
+function erdRelationshipPath(fromNode, fromColumn, toNode, toColumn) {
+  const fromY = erdColumnCenterY(fromNode, fromColumn);
+  const toY = erdColumnCenterY(toNode, toColumn);
+  const fromCenterX = fromNode.x + fromNode.width / 2;
+  const toCenterX = toNode.x + toNode.width / 2;
+  const goRight = toCenterX >= fromCenterX;
+  const x1 = goRight ? fromNode.x + fromNode.width : fromNode.x;
+  const x2 = goRight ? toNode.x : toNode.x + toNode.width;
+  const midX = (x1 + x2) / 2;
+  return {
+    d: `M ${x1} ${fromY} C ${midX} ${fromY}, ${midX} ${toY}, ${x2} ${toY}`,
+    fromX: x1,
+    fromY,
+    toX: x2,
+    toY,
+    midX,
+  };
+}
+
+/**
+ * Renders a key icon used for primary/foreign key columns.
+ * @param {number} x
+ * @param {number} y
+ * @param {boolean} isPrimary
+ */
+function erdKeyIcon(x, y, isPrimary) {
+  const cls = isPrimary ? "erd-key-primary" : "erd-key-muted";
+  return `<g class="${cls}" transform="translate(${x} ${y})">
+    <circle cx="4" cy="4" r="3.2" fill="none" stroke-width="1.5"></circle>
+    <path d="M 7 4 H 14 M 11 4 V 7 M 14 4 V 7" fill="none" stroke-width="1.5" stroke-linecap="round"></path>
+  </g>`;
+}
+
+/**
+ * Renders one table card for the ERD SVG.
+ * @param {{ name: string, x: number, y: number, width: number, height: number, columns: Array<{ name: string, type: string, isPk: boolean, isFk: boolean }> }} node
+ */
+function renderErdNode(node) {
+  const rows = node.columns.length
+    ? node.columns
+        .map((col, i) => {
+          const y = ERD_HEADER_HEIGHT + i * ERD_ROW_HEIGHT;
+          const textY = y + 15;
+          const classes = ["erd-column-row"];
+          if (col.isPk) classes.push("primary-key");
+          if (col.isFk) classes.push("foreign-key");
+          const key =
+            col.isPk || col.isFk
+              ? erdKeyIcon(node.width - 44, y + 6, col.isPk)
+              : "";
+          return `<g class="${classes.join(" ")}">
+            <text x="16" y="${textY}" class="erd-column-text">${escapeHtml(col.name)}<tspan class="erd-column-type"> - ${escapeHtml(col.type)}</tspan></text>
+            ${key}
+          </g>`;
+        })
+        .join("")
+    : `<text x="16" y="${ERD_HEADER_HEIGHT + 15}" class="erd-column-type">(no columns)</text>`;
+
+  return `<g class="erd-node" data-table="${escapeHtml(node.name)}" transform="translate(${node.x} ${node.y})">
+    <rect width="${node.width}" height="${node.height}" rx="8" class="erd-node-body"></rect>
+    <rect width="${node.width}" height="${ERD_HEADER_HEIGHT}" rx="8" class="erd-node-header"></rect>
+    <path d="M 0 34 H ${node.width} V ${ERD_HEADER_HEIGHT} H 0 Z" class="erd-node-header"></path>
+    <text x="16" y="26" class="erd-node-title">${escapeHtml(node.name)}</text>
+    ${rows}
+  </g>`;
+}
+
+/**
+ * Renders a relationship line with 1/N cardinality labels.
+ * @param {{ fromTable: string, fromColumn: string, toTable: string, toColumn: string }} rel
+ * @param {Map<string, any>} nodes
+ */
+function renderErdRelationship(rel, nodes) {
+  const fromNode = nodes.get(rel.fromTable);
+  const toNode = nodes.get(rel.toTable);
+  if (!fromNode || !toNode) return "";
+
+  const path = erdRelationshipPath(fromNode, rel.fromColumn, toNode, rel.toColumn);
+  const nLabelX = path.fromX + (path.midX - path.fromX) * 0.35;
+  const oneLabelX = path.toX + (path.midX - path.toX) * 0.35;
+
+  return `<g class="erd-relationship" data-from="${escapeHtml(rel.fromTable)}" data-to="${escapeHtml(rel.toTable)}">
+    <path d="${path.d}" class="erd-line" fill="none"></path>
+    <text class="erd-cardinality" x="${nLabelX}" y="${path.fromY - 8}">N</text>
+    <text class="erd-cardinality" x="${oneLabelX}" y="${path.toY - 8}">1</text>
+  </g>`;
+}
+
+/**
+ * Converts a pointer event into ERD diagram coordinates (accounts for scroll + zoom).
+ * @param {PointerEvent} event
+ */
+function pointerToErdCoords(event) {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!scroll) return { x: 0, y: 0 };
+  const rect = scroll.getBoundingClientRect();
+  return {
+    x: (event.clientX - rect.left + scroll.scrollLeft) / erdZoom,
+    y: (event.clientY - rect.top + scroll.scrollTop) / erdZoom,
+  };
+}
+
+/**
+ * Expands the SVG canvas so dragged tables stay inside the scrollable area.
+ */
+function syncErdCanvasSize() {
+  if (!erdState) return;
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!svg || !scroll) return;
+
+  let maxX = 0;
+  let maxY = 0;
+  for (const node of erdState.nodes.values()) {
+    maxX = Math.max(maxX, node.x + node.width);
+    maxY = Math.max(maxY, node.y + node.height);
+  }
+
+  const width = Math.max(Math.ceil(maxX + ERD_PAD_X), Math.ceil(scroll.clientWidth / erdZoom));
+  const height = Math.max(Math.ceil(maxY + ERD_PAD_Y), Math.ceil(scroll.clientHeight / erdZoom));
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.style.width = `${width}px`;
+  svg.style.height = `${height}px`;
+}
+
+/**
+ * Redraws relationship lines from the current node positions.
+ */
+function updateErdRelationships() {
+  if (!erdState) return;
+  const group = el.resultsBody.querySelector("#erd-relationships");
+  if (!group) return;
+  group.innerHTML = erdState.relationships
+    .map((rel) => renderErdRelationship(rel, erdState.nodes))
+    .join("");
+}
+
+/**
+ * Finds the SVG group for a table card by table name.
+ * @param {string} tableName
+ */
+function findErdNodeEl(tableName) {
+  return [...el.resultsBody.querySelectorAll(".erd-node")].find(
+    (nodeEl) => nodeEl.getAttribute("data-table") === tableName
+  );
+}
+
+/**
+ * Moves a table node in the diagram and updates connected relationship lines.
+ * @param {string} tableName
+ * @param {number} x
+ * @param {number} y
+ */
+function moveErdNode(tableName, x, y) {
+  if (!erdState) return;
+  const node = erdState.nodes.get(tableName);
+  if (!node) return;
+
+  node.x = Math.max(ERD_MIN_POS, x);
+  node.y = Math.max(ERD_MIN_POS, y);
+  erdPositions.set(tableName, { x: node.x, y: node.y });
+
+  const nodeEl = findErdNodeEl(tableName);
+  if (nodeEl) nodeEl.setAttribute("transform", `translate(${node.x} ${node.y})`);
+
+  updateErdRelationships();
+  syncErdCanvasSize();
+}
+
+/**
+ * Starts dragging an ERD table card.
+ * @param {PointerEvent} event
+ * @param {SVGGElement} nodeEl
+ */
+function startErdDrag(event, nodeEl) {
+  if (event.button !== 0 || !erdState) return;
+  const tableName = nodeEl.getAttribute("data-table");
+  const node = tableName ? erdState.nodes.get(tableName) : null;
+  if (!tableName || !node) return;
+
+  const point = pointerToErdCoords(event);
+  erdDrag = {
+    tableName,
+    offsetX: point.x - node.x,
+    offsetY: point.y - node.y,
+    pointerId: event.pointerId,
+  };
+
+  nodeEl.classList.add("is-dragging");
+  nodeEl.parentNode.appendChild(nodeEl);
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (scroll) scroll.classList.add("is-dragging");
+  nodeEl.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+/**
+ * Continues an active ERD table drag.
+ * @param {PointerEvent} event
+ */
+function onErdPointerMove(event) {
+  if (!erdDrag || event.pointerId !== erdDrag.pointerId) return;
+  const point = pointerToErdCoords(event);
+  moveErdNode(erdDrag.tableName, point.x - erdDrag.offsetX, point.y - erdDrag.offsetY);
+}
+
+/**
+ * Ends an active ERD table drag.
+ * @param {PointerEvent} event
+ */
+function endErdDrag(event) {
+  if (!erdDrag || event.pointerId !== erdDrag.pointerId) return;
+  const nodeEl = findErdNodeEl(erdDrag.tableName);
+  if (nodeEl) nodeEl.classList.remove("is-dragging");
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (scroll) scroll.classList.remove("is-dragging");
+  erdDrag = null;
+}
+
+/**
+ * Attaches pointer listeners so ERD table cards can be dragged.
+ */
+function bindErdDragHandlers() {
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  if (!svg) return;
+
+  svg.querySelectorAll(".erd-node").forEach((nodeEl) => {
+    nodeEl.addEventListener("pointerdown", (event) => startErdDrag(event, nodeEl));
+    nodeEl.addEventListener("pointermove", onErdPointerMove);
+    nodeEl.addEventListener("pointerup", endErdDrag);
+    nodeEl.addEventListener("pointercancel", endErdDrag);
+  });
+}
+
+/**
+ * Applies the current ERD zoom to the SVG and label.
+ */
+function applyErdZoom() {
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  if (svg) svg.style.transform = `scale(${erdZoom})`;
+  el.erdZoomLabel.textContent = `${Math.round(erdZoom * 100)}%`;
+  syncErdCanvasSize();
+}
+
+/**
+ * Changes ERD zoom by a delta and clamps to min/max.
+ * @param {number} delta
+ */
+function changeErdZoom(delta) {
+  erdZoom = Math.min(ERD_ZOOM_MAX, Math.max(ERD_ZOOM_MIN, Math.round((erdZoom + delta) * 10) / 10));
+  applyErdZoom();
+}
+
+/**
+ * Fetches schema metadata and renders an ERD into the results pane.
+ */
+async function renderErd() {
+  if (!pg) return;
+
+  erdDrag = null;
+  erdState = null;
+  el.resultsBody.className = "results-body erd-body";
+  el.resultsBody.innerHTML = `<div class="empty-hint">Loading ERD…</div>`;
+  el.resultsMeta.textContent = "";
+
+  const schema = await fetchErdSchema();
+  if (!schema.tables.length) {
+    el.resultsBody.innerHTML = `<div class="empty-hint">No tables yet. Create or upload tables to see an ERD.</div>`;
+    el.resultsMeta.textContent = "0 tables";
+    return;
+  }
+
+  const { nodes, width, height } = layoutErdNodes(schema.tables);
+  erdState = { nodes, relationships: schema.relationships };
+
+  const relationshipsSvg = schema.relationships
+    .map((rel) => renderErdRelationship(rel, nodes))
+    .join("");
+  const nodesSvg = [...nodes.values()].map((node) => renderErdNode(node)).join("");
+
+  el.resultsBody.innerHTML = `
+    <div class="erd-scroll">
+      <svg class="erd-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
+           role="group" aria-label="Interactive entity relationship diagram"
+           style="width: ${width}px; height: ${height}px; transform: scale(${erdZoom});">
+        <g id="erd-relationships">${relationshipsSvg}</g>
+        <g id="erd-nodes">${nodesSvg}</g>
+      </svg>
+    </div>`;
+
+  const relCount = schema.relationships.length;
+  el.resultsMeta.textContent = `${schema.tables.length} table(s) · ${relCount} relationship(s)`;
+  bindErdDragHandlers();
+  applyErdZoom();
 }
 
 // ---- Upload / Download -----------------------------------------------------
@@ -1321,6 +1869,14 @@ function initEventListeners() {
   });
 
   el.refreshTables.addEventListener("click", () => refreshTables());
+
+  el.viewResults.addEventListener("click", () => setResultsView("results"));
+  el.viewErd.addEventListener("click", () => setResultsView("erd"));
+  el.erdZoomIn.addEventListener("click", () => changeErdZoom(ERD_ZOOM_STEP));
+  el.erdZoomOut.addEventListener("click", () => changeErdZoom(-ERD_ZOOM_STEP));
+  el.erdRefresh.addEventListener("click", () => {
+    if (resultsViewMode === "erd") renderErd().catch(console.error);
+  });
 
   el.toggleSidebar.addEventListener("click", () => {
     const collapsed = el.sidebar.classList.toggle("collapsed");
