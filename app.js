@@ -1,8 +1,16 @@
 // ---- Config -----------------------------------------------------------
 
 const MONACO_VERSION = "0.52.2";
-const PGLITE_URL = "https://cdn.jsdelivr.net/npm/@electric-sql/pglite/dist/index.js";
+const PGLITE_VERSION = "0.5.4";
+const PGLITE_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/index.js`;
+const PGLITE_WORKER_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/worker/index.js`;
 const THEME_KEY = "pglite-theme";
+const DB_ID = "websql-studio";
+const DATA_DIR = `idb://${DB_ID}`;
+/** Enable multi-tab shared DB with ?shared=1 */
+const SHARED_DB_PARAM = "shared";
+const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
+const DEFAULT_DB_LABEL = useSharedDb ? DATA_DIR : "in-memory";
 
 const DEFAULT_SQL = `-- Welcome to WebSQL Studio, running PostgreSQL Lite (PGlite).
 -- Write SQL below and press Run (or Ctrl/Cmd + Enter).
@@ -14,10 +22,11 @@ select now() as server_time, version() as postgres_version;`;
 let pg = null;
 let editor = null;
 let monacoRef = null;
-let currentFileLabel = "in-memory";
+let currentFileLabel = DEFAULT_DB_LABEL;
 let currentResultSets = [];
 let columnsCache = new Map();
 let dataLoadingDepth = 0;
+let unsubLeaderChange = null;
 
 // ---- DOM refs -------------------------------------------------------------
 
@@ -197,16 +206,119 @@ function applySqlUrlParameter() {
 
 // ---- PGlite setup ------------------------------------------------------------
 
-async function loadPGliteModule() {
+/**
+ * Dynamically loads the main-thread PGlite constructor from the CDN.
+ */
+async function loadPGlite() {
   const mod = await import(PGLITE_URL);
   return mod.PGlite;
 }
 
-async function createDatabase(options) {
-  const PGlite = await loadPGliteModule();
-  return PGlite.create(options || {});
+/**
+ * Dynamically loads the PGliteWorker client from the CDN.
+ */
+async function loadPGliteWorker() {
+  const mod = await import(PGLITE_WORKER_URL);
+  return mod.PGliteWorker;
 }
 
+/**
+ * Creates a module Worker from an inlined Blob URL (no separate worker file).
+ */
+function createPGliteBlobWorker() {
+  const source = `
+import { PGlite } from ${JSON.stringify(PGLITE_URL)};
+import { worker } from ${JSON.stringify(PGLITE_WORKER_URL)};
+
+worker({
+  async init(options) {
+    return new PGlite({
+      dataDir: options.dataDir,
+      loadDataDir: options.loadDataDir,
+    });
+  },
+});
+`;
+  const blob = new Blob([source], { type: "text/javascript" });
+  return new Worker(URL.createObjectURL(blob), { type: "module" });
+}
+
+/**
+ * Creates a database: private in-memory PGlite by default, or a shared
+ * PGliteWorker + IndexedDB instance when ?shared=1 is present.
+ * @param {{ loadDataDir?: Blob | File }} [options] - Extra PGlite options (e.g. tarball load).
+ */
+async function createDatabase(options = {}) {
+  if (useSharedDb) {
+    const PGliteWorker = await loadPGliteWorker();
+    return PGliteWorker.create(createPGliteBlobWorker(), {
+      id: DB_ID,
+      dataDir: DATA_DIR,
+      ...options,
+    });
+  }
+
+  const PGlite = await loadPGlite();
+  return PGlite.create(options);
+}
+
+/**
+ * Deletes the shared IndexedDB database used by dataDir.
+ * @param {string} name - IndexedDB database name (path after idb://).
+ */
+function deleteIndexedDb(name) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.deleteDatabase(name);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error || new Error(`Failed to delete IndexedDB "${name}"`));
+    req.onblocked = () => {
+      // Other tabs/iframes may still hold the DB; deletion finishes when they close.
+      console.warn(`IndexedDB "${name}" delete blocked by other connections`);
+    };
+  });
+}
+
+/**
+ * Closes the current client. In shared mode, also wipes the IndexedDB store.
+ */
+async function wipeCurrentDatabaseStore() {
+  if (unsubLeaderChange) {
+    unsubLeaderChange();
+    unsubLeaderChange = null;
+  }
+  if (pg) {
+    try {
+      await pg.close();
+    } catch (_) {
+      /* ignore */
+    }
+    pg = null;
+  }
+  if (useSharedDb) {
+    await deleteIndexedDb(DB_ID);
+  }
+}
+
+/**
+ * Subscribes to leader changes so the table list stays in sync across tabs/iframes.
+ * @param {object} instance - PGlite or PGliteWorker instance.
+ */
+function bindLeaderChange(instance) {
+  if (unsubLeaderChange) {
+    unsubLeaderChange();
+    unsubLeaderChange = null;
+  }
+  if (!useSharedDb || !instance || typeof instance.onLeaderChange !== "function") return;
+  unsubLeaderChange = instance.onLeaderChange(() => {
+    refreshTables().catch(() => {});
+  });
+}
+
+/**
+ * Replaces the active database handle and refreshes UI.
+ * @param {() => Promise<object>} factory - Async factory that returns a DB client.
+ * @param {string} label - Label shown in the status bar.
+ */
 async function switchDatabase(factory, label) {
   setBusy(true);
   setStatus("Loading database…");
@@ -221,6 +333,7 @@ async function switchDatabase(factory, label) {
       }
     }
     pg = next;
+    bindLeaderChange(pg);
     setDbLabel(label);
     setStatus("Ready");
     await refreshTables();
@@ -237,7 +350,7 @@ async function switchDatabase(factory, label) {
 
 async function importIntoCurrentDatabase(file) {
   if (!pg) {
-    await switchDatabase(() => createDatabase(), "in-memory");
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
   }
 
   const kind = extOf(file.name);
@@ -788,7 +901,7 @@ function extOf(name) {
 async function importGistCsvs(gistId) {
   if (!gistId || !gistId.trim()) throw new Error("Please provide a gist ID.");
   if (!pg) {
-    await switchDatabase(() => createDatabase(), "in-memory");
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
   }
 
   const id = gistId.trim();
@@ -827,6 +940,7 @@ async function handleUpload(file) {
 
   try {
     if (kind === "tarball") {
+      await wipeCurrentDatabaseStore();
       await switchDatabase(() => createDatabase({ loadDataDir: file }), file.name);
       showToast(`Loaded "${file.name}"`, "success");
       return;
@@ -834,7 +948,7 @@ async function handleUpload(file) {
 
     if (kind === "sql" || kind === "csv" || kind === "excel") {
       await importIntoCurrentDatabase(file);
-      setDbLabel(currentFileLabel === "in-memory" ? file.name : currentFileLabel);
+      setDbLabel(currentFileLabel === DEFAULT_DB_LABEL ? file.name : currentFileLabel);
       await refreshTables();
       clearResults("Run a query to see results here.");
       showToast(`Imported "${file.name}"`, "success");
@@ -909,7 +1023,8 @@ async function loadDataFromUrls(label, urls) {
     }
     console.log("urls",urls)
     console.log("pieces",pieces)
-    await switchDatabase(() => createDatabase(), "in-memory");
+    await wipeCurrentDatabaseStore();
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
     await handleUpload(file);
     runQuery()
   } catch (err) {
@@ -1192,7 +1307,10 @@ function initEventListeners() {
   el.menuClear.addEventListener("click", () => {
     setMenuOpen(false);
     if (confirm("Start a new, empty database? Any unsaved changes will be lost.")) {
-      switchDatabase(() => createDatabase(), "in-memory");
+      (async () => {
+        await wipeCurrentDatabaseStore();
+        await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
+      })();
     }
   });
 
@@ -1217,11 +1335,11 @@ async function main() {
   initEventListeners();
   initResizer();
   await initMonaco();
- // await switchDatabase(() => createDatabase(), "in-memory");
+  await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
   applySqlUrlParameter();
 }
 
-// Resolves once the default in-memory database is ready. External code (e.g.
+// Resolves once the default database is ready. External code (e.g.
 // the Blogger template) that wants to auto-load a default database on boot
 // must wait on this first - otherwise it races main()'s own createDatabase()
 // call and whichever finishes last silently overwrites the other.
