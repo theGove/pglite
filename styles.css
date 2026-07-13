@@ -773,8 +773,7 @@ table.result-table tbody tr:hover {
   /* Allow one-finger pan; custom JS handles two-finger pinch zoom. */
   touch-action: pan-x pan-y;
   background:
-    linear-gradient(var(--erd-grid) 1px, transparent 1px) 0 0 / 28px 28px,
-    linear-gradient(90deg, var(--erd-grid) 1px, transparent 1px) 0 0 / 28px 28px,
+    radial-gradient(circle, var(--erd-grid) 1.25px, transparent 1.3px) 0 0 / 20px 20px,
     var(--erd-bg);
 }
 
