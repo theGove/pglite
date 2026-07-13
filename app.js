@@ -30,7 +30,7 @@ let unsubLeaderChange = null;
 /** @type {'results' | 'erd'} */
 let resultsViewMode = "results";
 let erdZoom = 1;
-/** @type {Map<string, { x: number, y: number }>} */
+/** @type {Map<string, { x: number, y: number }>} User-dragged ERD positions only. */
 let erdPositions = new Map();
 /** @type {{ nodes: Map<string, any>, relationships: Array<any> } | null} */
 let erdState = null;
@@ -926,57 +926,265 @@ function formatErdType(dataType) {
 }
 
 /**
- * Lays out ERD tables in a wrapping grid and returns node geometry.
- * Reuses any saved drag positions for tables the user has already moved.
- * @param {Array<{ name: string, columns: unknown[] }>} tables
+ * Computes the rendered height of an ERD table card.
+ * @param {{ columns: unknown[] }} table
  */
-function layoutErdNodes(tables) {
-  const colsPerRow = Math.max(1, Math.ceil(Math.sqrt(tables.length)));
-  const nodes = new Map();
-  let x = ERD_PAD_X;
-  let y = ERD_PAD_Y;
-  let rowMaxHeight = 0;
-  let col = 0;
+function erdTableHeight(table) {
+  return ERD_HEADER_HEIGHT + Math.max(table.columns?.length || 0, 1) * ERD_ROW_HEIGHT + 8;
+}
+
+/**
+ * Assigns each table a horizontal layer (parents left, children right) from FK edges.
+ * @param {string[]} names
+ * @param {Array<{ fromTable: string, toTable: string }>} relationships
+ */
+function assignErdLayers(names, relationships) {
+  const nameSet = new Set(names);
+  /** @type {Map<string, string[]>} */
+  const childrenOf = new Map(names.map((n) => [n, []]));
+  /** @type {Map<string, string[]>} */
+  const parentsOf = new Map(names.map((n) => [n, []]));
+  /** @type {Map<string, number>} */
+  const indegree = new Map(names.map((n) => [n, 0]));
+
+  for (const rel of relationships) {
+    if (!nameSet.has(rel.fromTable) || !nameSet.has(rel.toTable)) continue;
+    if (rel.fromTable === rel.toTable) continue;
+    const parent = rel.toTable;
+    const child = rel.fromTable;
+    if (childrenOf.get(parent).includes(child)) continue;
+    childrenOf.get(parent).push(child);
+    parentsOf.get(child).push(parent);
+    indegree.set(child, indegree.get(child) + 1);
+  }
+
+  const queue = names.filter((n) => indegree.get(n) === 0);
+  const indeg = new Map(indegree);
+  const topo = [];
+  while (queue.length) {
+    const n = queue.shift();
+    topo.push(n);
+    for (const child of childrenOf.get(n)) {
+      indeg.set(child, indeg.get(child) - 1);
+      if (indeg.get(child) === 0) queue.push(child);
+    }
+  }
+  for (const n of names) {
+    if (!topo.includes(n)) topo.push(n);
+  }
+
+  /** @type {Map<string, number>} */
+  const layer = new Map();
+  for (const n of topo) {
+    const parents = parentsOf.get(n);
+    layer.set(n, parents.length ? Math.max(...parents.map((p) => layer.get(p) || 0)) + 1 : 0);
+  }
+
+  return { layer, childrenOf, parentsOf };
+}
+
+/**
+ * Orders tables within each layer to reduce relationship-line crossings.
+ * @param {string[]} names
+ * @param {Map<string, number>} layerMap
+ * @param {Map<string, string[]>} parentsOf
+ * @param {Map<string, string[]>} childrenOf
+ * @param {Array<{ fromTable: string, fromColumn: string, toTable: string }>} relationships
+ * @param {Array<{ name: string, columns: Array<{ name: string }> }>} tables
+ */
+function orderErdLayers(names, layerMap, parentsOf, childrenOf, relationships, tables) {
+  const maxLayer = names.reduce((max, n) => Math.max(max, layerMap.get(n) || 0), 0);
+  /** @type {string[][]} */
+  const layers = Array.from({ length: maxLayer + 1 }, () => []);
+  for (const n of names) layers[layerMap.get(n) || 0].push(n);
+  for (const group of layers) group.sort((a, b) => a.localeCompare(b));
+
+  /** @type {Map<string, Map<string, number>>} */
+  const columnIndex = new Map();
+  for (const table of tables) {
+    const cols = new Map();
+    (table.columns || []).forEach((col, idx) => cols.set(col.name, idx));
+    columnIndex.set(table.name, cols);
+  }
+
+  /**
+   * Average index of related tables in a neighboring layer.
+   * @param {string[]} related
+   * @param {string[]} neighbor
+   */
+  function barycenter(related, neighbor) {
+    const hits = related.filter((r) => neighbor.includes(r));
+    if (!hits.length) return neighbor.length / 2;
+    return hits.reduce((sum, r) => sum + neighbor.indexOf(r), 0) / hits.length;
+  }
+
+  /**
+   * Sort key for a parent using child positions and FK column order (reduces crossings).
+   * @param {string} parent
+   * @param {string[]} childLayer
+   */
+  function parentCrossingKey(parent, childLayer) {
+    const rels = relationships.filter(
+      (r) => r.toTable === parent && childLayer.includes(r.fromTable)
+    );
+    if (!rels.length) return barycenter(childrenOf.get(parent) || [], childLayer);
+    return (
+      rels.reduce((sum, r) => {
+        const childIdx = childLayer.indexOf(r.fromTable);
+        const colIdx = columnIndex.get(r.fromTable)?.get(r.fromColumn) ?? 0;
+        return sum + childIdx * 1000 + colIdx;
+      }, 0) / rels.length
+    );
+  }
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    for (let i = 1; i < layers.length; i += 1) {
+      layers[i].sort((a, b) => {
+        const diff =
+          barycenter(parentsOf.get(a) || [], layers[i - 1]) -
+          barycenter(parentsOf.get(b) || [], layers[i - 1]);
+        return diff || a.localeCompare(b);
+      });
+    }
+    for (let i = layers.length - 2; i >= 0; i -= 1) {
+      layers[i].sort((a, b) => {
+        const diff = parentCrossingKey(a, layers[i + 1]) - parentCrossingKey(b, layers[i + 1]);
+        return diff || a.localeCompare(b);
+      });
+    }
+  }
+
+  return layers;
+}
+
+/**
+ * Places layered tables left-to-right with parents before children.
+ * @param {Array<{ name: string, height: number }>} tables
+ * @param {string[][]} layers
+ */
+function placeErdLayers(tables, layers) {
+  const byName = new Map(tables.map((t) => [t.name, t]));
+  /** @type {Map<string, { x: number, y: number }>} */
+  const positions = new Map();
+
+  const layerHeights = layers.map((group) => {
+    if (!group.length) return 0;
+    return group.reduce((sum, name, idx) => {
+      const h = byName.get(name)?.height || ERD_HEADER_HEIGHT;
+      return sum + h + (idx > 0 ? ERD_GAP_Y : 0);
+    }, 0);
+  });
+  const tallest = Math.max(0, ...layerHeights);
+
   let maxX = ERD_PAD_X;
   let maxY = ERD_PAD_Y;
-  const nextPositions = new Map();
 
-  for (const table of tables) {
-    const height = ERD_HEADER_HEIGHT + Math.max(table.columns.length, 1) * ERD_ROW_HEIGHT + 8;
-    const saved = erdPositions.get(table.name);
-    let nodeX = x;
-    let nodeY = y;
+  for (let li = 0; li < layers.length; li += 1) {
+    const group = layers[li];
+    if (!group.length) continue;
+    const x = ERD_PAD_X + li * (ERD_NODE_WIDTH + ERD_GAP_X);
+    let y = ERD_PAD_Y + Math.max(0, (tallest - layerHeights[li]) / 2);
+    for (const name of group) {
+      const table = byName.get(name);
+      positions.set(name, { x, y });
+      y += (table?.height || ERD_HEADER_HEIGHT) + ERD_GAP_Y;
+      maxX = Math.max(maxX, x + ERD_NODE_WIDTH);
+      maxY = Math.max(maxY, y - ERD_GAP_Y);
+    }
+  }
 
-    if (saved) {
-      nodeX = saved.x;
-      nodeY = saved.y;
-    } else {
+  return { positions, maxX, maxY };
+}
+
+/**
+ * Lays out ERD tables using FK-aware layers so related tables sit cleanly
+ * side-by-side. Reuses any saved drag positions for tables the user moved.
+ * @param {Array<{ name: string, columns: unknown[] }>} tables
+ * @param {Array<{ fromTable: string, toTable: string }>} [relationships]
+ */
+function layoutErdNodes(tables, relationships = []) {
+  const prepared = tables.map((table) => ({
+    ...table,
+    height: erdTableHeight(table),
+  }));
+  const names = prepared.map((t) => t.name);
+  const linkedNames = new Set();
+  for (const rel of relationships) {
+    if (names.includes(rel.fromTable)) linkedNames.add(rel.fromTable);
+    if (names.includes(rel.toTable)) linkedNames.add(rel.toTable);
+  }
+  const linked = names.filter((n) => linkedNames.has(n));
+  const isolated = names.filter((n) => !linkedNames.has(n)).sort((a, b) => a.localeCompare(b));
+
+  /** @type {Map<string, { x: number, y: number }>} */
+  let autoPos = new Map();
+  let maxX = ERD_PAD_X;
+  let maxY = ERD_PAD_Y;
+
+  if (linked.length) {
+    const { layer, childrenOf, parentsOf } = assignErdLayers(linked, relationships);
+    const layers = orderErdLayers(
+      linked,
+      layer,
+      parentsOf,
+      childrenOf,
+      relationships,
+      prepared.filter((t) => linkedNames.has(t.name))
+    );
+    const placed = placeErdLayers(
+      prepared.filter((t) => linkedNames.has(t.name)),
+      layers
+    );
+    autoPos = placed.positions;
+    maxX = placed.maxX;
+    maxY = placed.maxY;
+  }
+
+  // Isolated tables sit in a tidy row beneath the linked diagram.
+  if (isolated.length) {
+    const startY = linked.length ? maxY + ERD_GAP_Y : ERD_PAD_Y;
+    let x = ERD_PAD_X;
+    let y = startY;
+    let rowMaxHeight = 0;
+    const colsPerRow = Math.max(1, Math.ceil(Math.sqrt(isolated.length)));
+    let col = 0;
+    for (const name of isolated) {
+      const table = prepared.find((t) => t.name === name);
+      const height = table?.height || ERD_HEADER_HEIGHT;
       if (col >= colsPerRow) {
         x = ERD_PAD_X;
         y += rowMaxHeight + ERD_GAP_Y;
         rowMaxHeight = 0;
         col = 0;
       }
-      nodeX = x;
-      nodeY = y;
+      autoPos.set(name, { x, y });
+      maxX = Math.max(maxX, x + ERD_NODE_WIDTH);
+      maxY = Math.max(maxY, y + height);
+      rowMaxHeight = Math.max(rowMaxHeight, height);
       x += ERD_NODE_WIDTH + ERD_GAP_X;
       col += 1;
-      rowMaxHeight = Math.max(rowMaxHeight, height);
     }
-
-    nodes.set(table.name, {
-      ...table,
-      x: nodeX,
-      y: nodeY,
-      width: ERD_NODE_WIDTH,
-      height,
-    });
-    nextPositions.set(table.name, { x: nodeX, y: nodeY });
-    maxX = Math.max(maxX, nodeX + ERD_NODE_WIDTH);
-    maxY = Math.max(maxY, nodeY + height);
   }
 
-  erdPositions = nextPositions;
+  const nodes = new Map();
+  const tableNames = new Set(prepared.map((t) => t.name));
+  for (const name of [...erdPositions.keys()]) {
+    if (!tableNames.has(name)) erdPositions.delete(name);
+  }
+
+  for (const table of prepared) {
+    const saved = erdPositions.get(table.name);
+    const auto = autoPos.get(table.name) || { x: ERD_PAD_X, y: ERD_PAD_Y };
+    const pos = saved || auto;
+    nodes.set(table.name, {
+      ...table,
+      x: pos.x,
+      y: pos.y,
+      width: ERD_NODE_WIDTH,
+    });
+    maxX = Math.max(maxX, pos.x + ERD_NODE_WIDTH);
+    maxY = Math.max(maxY, pos.y + table.height);
+  }
 
   return {
     nodes,
@@ -1362,7 +1570,7 @@ async function renderErd() {
     return;
   }
 
-  const { nodes, width, height } = layoutErdNodes(schema.tables);
+  const { nodes, width, height } = layoutErdNodes(schema.tables, schema.relationships);
   erdState = { nodes, relationships: schema.relationships };
 
   const relationshipsSvg = schema.relationships
