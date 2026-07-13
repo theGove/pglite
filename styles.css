@@ -3,7 +3,7 @@
   --panel: #ffffff;
   --border: #e3e6ea;
   --text: #1f2430;
-  --text-muted: #6b7280;
+  --text-muted: #aaa;
   --accent: #3b5bfd;
   --accent-hover: #2f4ce0;
   --danger: #d33d3d;
@@ -22,7 +22,7 @@
   --panel: #22252c;
   --border: #34373f;
   --text: #e7e9ee;
-  --text-muted: #9aa1ac;
+  --text-muted: #444;
   --accent: #6c8cff;
   --accent-hover: #839dff;
   --danger: #ff6b6b;

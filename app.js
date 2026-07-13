@@ -4,7 +4,7 @@ const MONACO_VERSION = "0.52.2";
 const PGLITE_URL = "https://cdn.jsdelivr.net/npm/@electric-sql/pglite/dist/index.js";
 const THEME_KEY = "pglite-theme";
 
-const DEFAULT_SQL = `-- Welcome to PGlite Studio.
+const DEFAULT_SQL = `-- Welcome to WebSQL Studio, running PostgreSQL Lite (PGlite).
 -- Write SQL below and press Run (or Ctrl/Cmd + Enter).
 
 select now() as server_time, version() as postgres_version;`;
@@ -28,6 +28,8 @@ const el = {
   menuPanel: document.getElementById("menu-panel"),
   menuUpload: document.getElementById("menu-upload"),
   menuDownload: document.getElementById("menu-download"),
+  //menuImportGist: document.getElementById("menu-import-gist"),
+  //menuSaveGist: document.getElementById("menu-save-gist"),
   menuExportExcel: document.getElementById("menu-export-excel"),
   menuTheme: document.getElementById("menu-theme"),
   themeIcon: document.getElementById("theme-icon"),
@@ -148,8 +150,10 @@ function initMonaco() {
     });
     require(["vs/editor/editor.main"], (monaco) => {
       monacoRef = monaco;
+      const params = new URLSearchParams(window.location.search);
+      const initialSql = params.has("sql") ? params.get("sql") : DEFAULT_SQL;
       editor = monaco.editor.create(el.editorPane, {
-        value: DEFAULT_SQL,
+        value: initialSql || DEFAULT_SQL,
         language: "sql",
         theme: monacoThemeFor(document.documentElement.getAttribute("data-theme")),
         fontSize: 13,
@@ -162,6 +166,18 @@ function initMonaco() {
       resolve();
     });
   });
+}
+
+function applySqlUrlParameter() {
+  if (!editor) return;
+
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has("sql")) return;
+
+  const value = params.get("sql");
+  if (value !== null) {
+    editor.setValue(value);
+  }
 }
 
 // ---- PGlite setup ------------------------------------------------------------
@@ -414,6 +430,12 @@ function isNumericValue(value) {
   return typeof value === "number" || (typeof value === "string" && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(value.trim()));
 }
 
+function formatDateValue(d) {
+  const iso = d.toISOString();
+  if (iso.endsWith("T00:00:00.000Z")) return iso.slice(0, 10);
+  return iso.replace("T", " ").replace("Z", "");
+}
+
 function renderTable(res) {
   const cols = res.fields.map((f) => f.name);
   const head = `<tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
@@ -423,6 +445,7 @@ function renderTable(res) {
         .map((c) => {
           const v = row[c];
           if (v === null || v === undefined) return `<td class="cell-null">null</td>`;
+          if (v instanceof Date) return `<td>${escapeHtml(formatDateValue(v))}</td>`;
           if (typeof v === "object") return `<td>${escapeHtml(JSON.stringify(v))}</td>`;
           const cellClass = isNumericValue(v) ? "cell-numeric" : "";
           return `<td class="${cellClass}">${escapeHtml(String(v))}</td>`;
@@ -689,13 +712,17 @@ async function importTabularRowsIntoDatabase(db, tableName, rows) {
   }
 }
 
-async function importCsvIntoDatabase(db, file) {
-  const text = await file.text();
+async function importCsvTextIntoDatabase(db, text, tableName) {
   const rows = parseCsv(text);
   if (!rows.length) throw new Error("CSV file is empty.");
 
-  const tableName = sanitizeIdentifier(file.name.replace(/\.[^.]+$/, "")) || "uploaded_data";
-  await importTabularRowsIntoDatabase(db, tableName, rows);
+  await importTabularRowsIntoDatabase(db, sanitizeIdentifier(tableName) || "uploaded_data", rows);
+}
+
+async function importCsvIntoDatabase(db, file) {
+  const text = await file.text();
+  const tableName = file.name.replace(/\.[^.]+$/, "");
+  await importCsvTextIntoDatabase(db, text, tableName);
 }
 
 async function importExcelIntoDatabase(db, file) {
@@ -723,6 +750,42 @@ function extOf(name) {
   if (lower.endsWith(".csv")) return "csv";
   if (lower.endsWith(".xlsx") || lower.endsWith(".xlsm") || lower.endsWith(".xls")) return "excel";
   return "unknown";
+}
+
+async function importGistCsvs(gistId) {
+  if (!gistId || !gistId.trim()) throw new Error("Please provide a gist ID.");
+  if (!pg) {
+    await switchDatabase(() => createDatabase(), "in-memory");
+  }
+
+  const id = gistId.trim();
+  setDataLoading(true, `Importing gist ${id}…`);
+
+  try {
+    const response = await fetch(`https://api.github.com/gists/${id}`, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!response.ok) throw new Error(`Could not load gist ${id}.`);
+
+    const gist = await response.json();
+    const csvFiles = Object.entries(gist.files || {}).filter(([, meta]) => meta && typeof meta.filename === "string" && /\.csv$/i.test(meta.filename));
+    if (!csvFiles.length) throw new Error("No CSV files were found in that gist.");
+
+    for (const [filename, meta] of csvFiles) {
+      const rawUrl = meta.raw_url;
+      if (!rawUrl) throw new Error(`Missing raw URL for ${filename}.`);
+      const rawResponse = await fetch(rawUrl);
+      if (!rawResponse.ok) throw new Error(`Could not fetch ${filename}.`);
+      const text = await rawResponse.text();
+      await importCsvTextIntoDatabase(pg, text, filename.replace(/\.csv$/i, ""));
+    }
+
+    await refreshTables();
+    clearResults("Run a query to see results here.");
+    showToast(`Imported ${csvFiles.length} CSV file${csvFiles.length === 1 ? "" : "s"} from gist ${id}`, "success");
+  } finally {
+    setDataLoading(false);
+  }
 }
 
 async function handleUpload(file) {
@@ -792,7 +855,12 @@ async function loadDataFromUrls(label, urls) {
   setDataLoading(true, `Fetching "${label}"…`);
   setStatus(`Fetching "${label}"…`);
   try {
-    const pieces = await Promise.all(urls.map(fetchDataPiece));
+    const resolvedPieces = await Promise.all(
+      urls.map((url, index) => fetchDataPiece(url).then((piece) => ({ index, piece })))
+    );
+    const pieces = resolvedPieces
+      .sort((a, b) => a.index - b.index)
+      .map((entry) => entry.piece);
 
     let file;
     if (pieces.every((p) => p.kind === "blob")) {
@@ -806,6 +874,9 @@ async function loadDataFromUrls(label, urls) {
         ? new File([base64ToBytes(combinedText)], `${label}.tar.gz`)
         : new File([combinedText], `${label}.sql`, { type: "text/plain" });
     }
+    console.log("urls",urls)
+    console.log("pieces",pieces)
+    await switchDatabase(() => createDatabase(), "in-memory");
     await handleUpload(file);
   } catch (err) {
     console.error(err);
@@ -838,6 +909,86 @@ function addLoadDataOption(label, url) {
   return btn;
 }
 window.addLoadDataOption = addLoadDataOption;
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) return "";
+  const text = String(value);
+  if (/[",\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function rowsToCsv(rows, fields) {
+  const headers = (fields || []).map((field) => field.name || "");
+  const lines = [];
+  lines.push(headers.map(escapeCsvValue).join(","));
+  for (const row of rows || []) {
+    lines.push(headers.map((header) => escapeCsvValue(row[header] ?? "")).join(","));
+  }
+  return lines.join("\n");
+}
+
+async function handleSaveToGist() {
+  if (!pg) return;
+
+  const token = prompt("Enter your GitHub personal access token:");
+  if (!token) return;
+
+  const description = prompt("Optional gist description:") || "PGlite Studio export";
+  setBusy(true);
+  setStatus("Saving tables to gist…");
+  try {
+    const { rows: tables } = await pg.query(
+      `select table_name from information_schema.tables where table_schema = 'public' order by table_name;`
+    );
+
+    if (!tables.length) {
+      throw new Error("There are no tables to save.");
+    }
+
+    const files = {};
+    for (const table of tables) {
+      const tableName = table.table_name;
+      const { rows, fields } = await pg.query(`select * from "${tableName}";`);
+      const filename = `${sanitizeIdentifier(tableName) || "table"}.csv`;
+      files[filename] = { content: rowsToCsv(rows, fields) };
+    }
+
+    const response = await fetch("https://api.github.com/gists", {
+      method: "POST",
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        description,
+        public: false,
+        files,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(text || "Failed to create gist.");
+    }
+
+    const result = await response.json();
+    const gistUrl = result.html_url || result.url || "";
+    setStatus("Ready");
+    showToast(`Saved ${tables.length} table${tables.length === 1 ? "" : "s"} to gist`, "success");
+    if (gistUrl) {
+      window.open(gistUrl, "_blank", "noopener,noreferrer");
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus("Ready");
+    showToast("Could not save to gist: " + err.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
 
 async function handleDownload() {
   if (!pg) return;
@@ -976,6 +1127,23 @@ function initEventListeners() {
     handleDownload();
   });
 
+  // el.menuSaveGist.addEventListener("click", () => {
+  //   setMenuOpen(false);
+  //   handleSaveToGist();
+  // });
+
+  // el.menuImportGist.addEventListener("click", async () => {
+  //   setMenuOpen(false);
+  //   const gistId = prompt("Enter a GitHub gist ID or URL:");
+  //   if (!gistId) return;
+  //   try {
+  //     await importGistCsvs(gistId.replace(/^https?:\/\/gist\.github\.com\/[^/]+\//i, "").replace(/\/$/, ""));
+  //   } catch (err) {
+  //     console.error(err);
+  //     showToast(err.message || "Could not import gist CSVs", "error");
+  //   }
+  // });
+
   el.menuExportExcel.addEventListener("click", () => {
     setMenuOpen(false);
     handleExportExcel();
@@ -1016,6 +1184,7 @@ async function main() {
   initResizer();
   await initMonaco();
   await switchDatabase(() => createDatabase(), "in-memory");
+  applySqlUrlParameter();
 }
 
 // Resolves once the default in-memory database is ready. External code (e.g.
