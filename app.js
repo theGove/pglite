@@ -53,6 +53,9 @@ const el = {
   toast: document.getElementById("toast"),
   resizer: document.getElementById("resizer"),
   editorPane: document.getElementById("editor-pane"),
+  dbLoadingOverlay: document.getElementById("db-loading-overlay"),
+  dbLoadingTitle: document.getElementById("db-loading-title"),
+  dbLoadingSubtitle: document.getElementById("db-loading-subtitle"),
 };
 
 applyTheme(getPreferredTheme());
@@ -123,6 +126,16 @@ function setStatusBarVisible(isVisible) {
   }
 }
 
+function showDbLoadingOverlay(title, subtitle) {
+  el.dbLoadingTitle.textContent = title || "Loading database…";
+  el.dbLoadingSubtitle.textContent = subtitle || "This may take a moment on first load.";
+  el.dbLoadingOverlay.hidden = false;
+}
+
+function hideDbLoadingOverlay() {
+  el.dbLoadingOverlay.hidden = true;
+}
+
 function setDataLoading(isLoading, message = "Loading data…") {
   if (isLoading) {
     dataLoadingDepth += 1;
@@ -130,6 +143,7 @@ function setDataLoading(isLoading, message = "Loading data…") {
     el.loadingIndicator.hidden = false;
     el.loadingIndicator.style.display = "inline-flex";
     el.loadingIndicator.querySelector(".loading-label").textContent = message;
+    showDbLoadingOverlay(message, "This may take a moment.");
     return;
   }
 
@@ -138,6 +152,7 @@ function setDataLoading(isLoading, message = "Loading data…") {
     el.loadingIndicator.hidden = true;
     el.loadingIndicator.style.display = "none";
     setStatusBarVisible(false);
+    hideDbLoadingOverlay();
   }
 }
 
@@ -195,6 +210,7 @@ async function createDatabase(options) {
 async function switchDatabase(factory, label) {
   setBusy(true);
   setStatus("Loading database…");
+  setDataLoading(true, label && label !== "in-memory" ? `Loading "${label}"…` : "Loading database…");
   try {
     const next = await factory();
     if (pg) {
@@ -215,6 +231,7 @@ async function switchDatabase(factory, label) {
     showToast("Could not load database: " + err.message, "error");
   } finally {
     setBusy(false);
+    setDataLoading(false);
   }
 }
 
@@ -354,12 +371,28 @@ async function runMetaCommand(text) {
   throw new Error(`Unsupported meta command: ${commandToken}`);
 }
 
+function shrinkEditorToFitQuery() {
+  if (!editor || !monacoRef) return;
+  const minHeight = 80; // matches .editor-pane min-height in styles.css
+  const lineCount = editor.getModel().getLineCount();
+  const lineHeight = editor.getOption(monacoRef.editor.EditorOption.lineHeight);
+  const padding = editor.getOption(monacoRef.editor.EditorOption.padding) || { top: 0, bottom: 0 };
+  const fitHeight = lineCount * lineHeight + padding.top + padding.bottom;
+  const targetHeight = Math.max(fitHeight, minHeight);
+  const currentHeight = el.editorPane.getBoundingClientRect().height;
+  if (targetHeight < currentHeight) {
+    el.editorPane.style.flex = `0 0 ${targetHeight}px`;
+    editor.layout();
+  }
+}
+
 async function runQuery() {
   if (!pg) return;
   const sql = editor.getValue().trim();
   if (!sql) return;
 
   console.log("Executing query:", sql);
+  shrinkEditorToFitQuery();
 
   setBusy(true);
   setStatus("Running…");
@@ -438,9 +471,9 @@ function formatDateValue(d) {
 
 function renderTable(res) {
   const cols = res.fields.map((f) => f.name);
-  const head = `<tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
+  const head = `<tr><th class="row-num-col"></th>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
   const body = res.rows
-    .map((row) => {
+    .map((row, i) => {
       const cells = cols
         .map((c) => {
           const v = row[c];
@@ -451,7 +484,7 @@ function renderTable(res) {
           return `<td class="${cellClass}">${escapeHtml(String(v))}</td>`;
         })
         .join("");
-      return `<tr>${cells}</tr>`;
+      return `<tr><td class="row-num-col">${i + 1}</td>${cells}</tr>`;
     })
     .join("");
   return `<table class="result-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
@@ -878,6 +911,7 @@ async function loadDataFromUrls(label, urls) {
     console.log("pieces",pieces)
     await switchDatabase(() => createDatabase(), "in-memory");
     await handleUpload(file);
+    runQuery()
   } catch (err) {
     console.error(err);
     setStatus("Ready");
@@ -1183,7 +1217,7 @@ async function main() {
   initEventListeners();
   initResizer();
   await initMonaco();
-  await switchDatabase(() => createDatabase(), "in-memory");
+ // await switchDatabase(() => createDatabase(), "in-memory");
   applySqlUrlParameter();
 }
 
