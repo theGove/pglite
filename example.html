@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shared PGlite — multi-iframe demo</title>
+  <style>
+    :root {
+      --bg: #12141a;
+      --panel: #1a1d26;
+      --border: #2a2f3a;
+      --text: #e8eaef;
+      --muted: #9aa3b2;
+      --accent: #5b8def;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+
+    header h1 {
+      margin: 0 0 0.35rem;
+      font-size: 1.15rem;
+      font-weight: 600;
+    }
+
+    header p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.45;
+      max-width: 52rem;
+    }
+
+    header ol {
+      margin: 0.75rem 0 0;
+      padding-left: 1.25rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    header code {
+      font-size: 0.85em;
+      color: var(--accent);
+    }
+
+    .frames {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+      padding: 0.75rem;
+      min-height: 0;
+    }
+
+    .frame-wrap {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+
+    .frame-wrap h2 {
+      margin: 0;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      background: #151821;
+    }
+
+    iframe {
+      flex: 1;
+      width: 100%;
+      min-height: 420px;
+      border: 0;
+      background: #0d0f14;
+    }
+
+    @media (max-width: 900px) {
+      .frames {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shared PGlite multi-iframe demo</h1>
+    <p>
+      Both iframes load the studio with <code>?shared=1</code> so they share one
+      <code>idb://websql-studio</code> database via <code>PGliteWorker</code>.
+      Without that parameter, each visit gets a private in-memory DB.
+      Serve this folder over HTTP (not <code>file://</code>), then:
+    </p>
+    <ol>
+      <li>In <strong>Frame A</strong>, click Run to create <code>demo_shared</code> and insert a row.</li>
+      <li>In <strong>Frame B</strong>, click Run (or refresh tables) — you should see the same table/data.</li>
+      <li>Optional: Clear Data in one frame; after the other frame reloads or clears, both see an empty DB.</li>
+    </ol>
+  </header>
+
+  <div class="frames">
+    <section class="frame-wrap">
+      <h2>Frame A — write</h2>
+      <iframe
+        title="WebSQL Studio frame A"
+        src="index.html?shared=1&sql=-- Frame A: create shared data, then Run.%0Acreate table if not exists demo_shared (%0A  id serial primary key,%0A  note text,%0A  created_at timestamptz default now()%0A);%0A%0Ainsert into demo_shared (note) values ('hello from frame A');%0A%0Aselect * from demo_shared order by id;"
+      ></iframe>
+    </section>
+
+    <section class="frame-wrap">
+      <h2>Frame B — read</h2>
+      <iframe
+        title="WebSQL Studio frame B"
+        src="index.html?shared=1&sql=-- Frame B: after Frame A runs, click Run here.%0A-- You should see demo_shared without loading data again.%0A%0Aselect * from demo_shared order by id;%0A%0A-- Or list tables:%0A-- \\dt"
+      ></iframe>
+    </section>
+  </div>
+</body>
+</html>

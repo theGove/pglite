@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Push index.html / styles.css / app.js to their Blogger posts via the Apps Script endpoint.
+"""Push index.html / styles.css / app.js / pglite-worker.js to their Blogger posts.
 
 Usage:
-    python sync_to_blogger.py                # publish all three
+    python sync_to_blogger.py                # publish all registered assets
     python sync_to_blogger.py app.js          # publish just one (or a few)
 """
 
@@ -19,6 +19,9 @@ POSTS = {
     "app.js": ("193744643460984257", ROOT / "app.js"),
     "styles.css": ("3605221917047497476", ROOT / "styles.css"),
     "index.html": ("8271236875667927124", ROOT / "index.html"),
+    # Same-origin module worker required by app.js (`new Worker("./pglite-worker.js")`).
+    # Create a Blogger post that stores the raw file contents, then put its post ID here.
+    "pglite-worker.js": (None, ROOT / "pglite-worker.js"),
 }
 
 
@@ -50,6 +53,12 @@ def main():
 
     for name in names:
         post_id, path = POSTS[name]
+        if not post_id:
+            print(
+                f"Skipping {name}: no Blogger post ID configured in sync_to_blogger.py POSTS",
+                file=sys.stderr,
+            )
+            continue
         content = load_content(name, path)
         print(f"Publishing {name} -> post {post_id} ({len(content)} chars)...")
         try:
