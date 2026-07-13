@@ -844,14 +844,13 @@ table.result-table tbody tr:hover {
 .erd-line {
   stroke: var(--erd-line);
   stroke-width: 2;
+  stroke-linecap: butt;
 }
 
-.erd-cardinality {
-  fill: var(--erd-text);
-  font-size: 13px;
-  font-weight: 800;
-  stroke: var(--erd-node-bg);
-  stroke-width: 4;
-  paint-order: stroke;
-  text-anchor: middle;
+.erd-crowsfoot {
+  fill: none;
+  stroke: var(--erd-line);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }

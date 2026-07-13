@@ -777,6 +777,8 @@ const ERD_ZOOM_MIN = 0.5;
 const ERD_ZOOM_MAX = 2;
 const ERD_ZOOM_STEP = 0.1;
 const ERD_MIN_POS = 8;
+const ERD_CROWSFOOT_SPREAD = 7;
+const ERD_MARKER_CIRCLE_R = 3.5;
 
 /**
  * Switches the bottom pane between query results and the ERD view.
@@ -840,7 +842,8 @@ async function fetchErdSchema() {
        kcu.table_name as from_table,
        kcu.column_name as from_column,
        ccu.table_name as to_table,
-       ccu.column_name as to_column
+       ccu.column_name as to_column,
+       col.is_nullable
      from information_schema.table_constraints tc
      join information_schema.key_column_usage kcu
        on tc.constraint_schema = kcu.constraint_schema
@@ -851,6 +854,10 @@ async function fetchErdSchema() {
      join information_schema.constraint_column_usage ccu
        on rc.unique_constraint_schema = ccu.constraint_schema
       and rc.unique_constraint_name = ccu.constraint_name
+     join information_schema.columns col
+       on col.table_schema = kcu.table_schema
+      and col.table_name = kcu.table_name
+      and col.column_name = kcu.column_name
      where tc.constraint_type = 'FOREIGN KEY'
        and tc.table_schema = 'public';`
   );
@@ -877,12 +884,19 @@ async function fetchErdSchema() {
 
   return {
     tables: [...tables.values()],
-    relationships: fkRes.rows.map((r) => ({
-      fromTable: r.from_table,
-      fromColumn: r.from_column,
-      toTable: r.to_table,
-      toColumn: r.to_column,
-    })),
+    relationships: fkRes.rows.map((r) => {
+      const fkOptional = r.is_nullable === "YES";
+      return {
+        fromTable: r.from_table,
+        fromColumn: r.from_column,
+        toTable: r.to_table,
+        toColumn: r.to_column,
+        // Child end: a parent may have zero children (FK cannot require children).
+        manyKind: "zero-or-many",
+        // Parent end: required parent if FK is NOT NULL, otherwise optional.
+        oneKind: fkOptional ? "zero-or-one" : "one",
+      };
+    }),
   };
 }
 
@@ -983,13 +997,30 @@ function erdColumnCenterY(node, columnName) {
 }
 
 /**
+ * Returns how far from the entity edge the relationship line should stop
+ * so it meets the innermost crow's foot symbol with no gap.
+ * @param {'zero-or-many' | 'one-or-many' | 'zero-or-one' | 'one'} kind
+ */
+function erdMarkerDepth(kind) {
+  if (kind === "one") return 12;
+  if (kind === "one-or-many") return 10;
+  if (kind === "zero-or-many" || kind === "zero-or-one") {
+    // Crowfoot/bar near entity, then circle; line meets the far edge of the circle.
+    return 8 + ERD_MARKER_CIRCLE_R * 2;
+  }
+  return 8 + ERD_MARKER_CIRCLE_R * 2;
+}
+
+/**
  * Builds an SVG path for a relationship between two table sides.
  * @param {{ x: number, y: number, width: number, height: number, columns: Array<{ name: string }> }} fromNode
  * @param {string} fromColumn
  * @param {{ x: number, y: number, width: number, height: number, columns: Array<{ name: string }> }} toNode
  * @param {string} toColumn
+ * @param {number} fromDepth - Marker depth on the many (from) end.
+ * @param {number} toDepth - Marker depth on the one (to) end.
  */
-function erdRelationshipPath(fromNode, fromColumn, toNode, toColumn) {
+function erdRelationshipPath(fromNode, fromColumn, toNode, toColumn, fromDepth, toDepth) {
   const fromY = erdColumnCenterY(fromNode, fromColumn);
   const toY = erdColumnCenterY(toNode, toColumn);
   const fromCenterX = fromNode.x + fromNode.width / 2;
@@ -997,15 +1028,74 @@ function erdRelationshipPath(fromNode, fromColumn, toNode, toColumn) {
   const goRight = toCenterX >= fromCenterX;
   const x1 = goRight ? fromNode.x + fromNode.width : fromNode.x;
   const x2 = goRight ? toNode.x : toNode.x + toNode.width;
-  const midX = (x1 + x2) / 2;
+  // Direction from the line toward each entity (horizontal).
+  const fromToward = goRight ? -1 : 1;
+  const toToward = goRight ? 1 : -1;
+  const fromLineX = x1 - fromToward * fromDepth;
+  const toLineX = x2 - toToward * toDepth;
+  const midX = (fromLineX + toLineX) / 2;
   return {
-    d: `M ${x1} ${fromY} C ${midX} ${fromY}, ${midX} ${toY}, ${x2} ${toY}`,
+    d: `M ${fromLineX} ${fromY} C ${midX} ${fromY}, ${midX} ${toY}, ${toLineX} ${toY}`,
     fromX: x1,
     fromY,
     toX: x2,
     toY,
-    midX,
+    fromToward,
+    toToward,
   };
+}
+
+/**
+ * Renders a crow's foot cardinality marker at a relationship endpoint.
+ * Outer symbol (nearest the entity) is maximum cardinality; inner is minimum.
+ * The relationship line is drawn to meet the innermost symbol edge.
+ * @param {number} x - Attachment x on the entity edge.
+ * @param {number} y - Attachment y on the entity edge.
+ * @param {number} towardEntity - Horizontal direction from line toward the entity (-1 or 1).
+ * @param {'zero-or-many' | 'one-or-many' | 'zero-or-one' | 'one'} kind - Full crow's foot cardinality.
+ */
+function renderErdCardinalityMarker(x, y, towardEntity, kind) {
+  const spread = ERD_CROWSFOOT_SPREAD;
+  const r = ERD_MARKER_CIRCLE_R;
+  const depth = erdMarkerDepth(kind);
+  /**
+   * X position measured outward from the entity edge toward the relationship line.
+   * @param {number} offset
+   */
+  const along = (offset) => x - towardEntity * offset;
+
+  const crowfoot = (tipOffset, heelOffset) => {
+    const tipX = along(tipOffset);
+    const heelX = along(heelOffset);
+    return `M ${heelX} ${y} L ${tipX} ${y - spread} M ${heelX} ${y} L ${tipX} ${y} M ${heelX} ${y} L ${tipX} ${y + spread}`;
+  };
+
+  const bar = (offset) => {
+    const bx = along(offset);
+    return `M ${bx} ${y - spread} L ${bx} ${y + spread}`;
+  };
+
+  const circleAt = (centerOffset) => {
+    const cx = along(centerOffset);
+    return `<circle class="erd-crowsfoot" cx="${cx}" cy="${y}" r="${r}"></circle>`;
+  };
+
+  if (kind === "zero-or-many") {
+    // Foot against the entity; circle touches the foot heel; line meets far circle edge.
+    const circleCenter = depth - r;
+    const footHeel = circleCenter - r;
+    return `${circleAt(circleCenter)}<path class="erd-crowsfoot" d="${crowfoot(0, footHeel)}"></path>`;
+  }
+  if (kind === "one-or-many") {
+    // Foot against the entity; mandatory bar at the line junction.
+    return `<path class="erd-crowsfoot" d="${bar(depth)} ${crowfoot(0, depth)}"></path>`;
+  }
+  if (kind === "zero-or-one") {
+    const circleCenter = depth - r;
+    return `${circleAt(circleCenter)}<path class="erd-crowsfoot" d="${bar(4)}"></path>`;
+  }
+  // one (one and only one): line meets the outer bar.
+  return `<path class="erd-crowsfoot" d="${bar(5)} ${bar(depth)}"></path>`;
 }
 
 /**
@@ -1057,8 +1147,8 @@ function renderErdNode(node) {
 }
 
 /**
- * Renders a relationship line with 1/N cardinality labels.
- * @param {{ fromTable: string, fromColumn: string, toTable: string, toColumn: string }} rel
+ * Renders a relationship line using crow's foot notation with min/max cardinality.
+ * @param {{ fromTable: string, fromColumn: string, toTable: string, toColumn: string, manyKind: string, oneKind: string }} rel
  * @param {Map<string, any>} nodes
  */
 function renderErdRelationship(rel, nodes) {
@@ -1066,14 +1156,23 @@ function renderErdRelationship(rel, nodes) {
   const toNode = nodes.get(rel.toTable);
   if (!fromNode || !toNode) return "";
 
-  const path = erdRelationshipPath(fromNode, rel.fromColumn, toNode, rel.toColumn);
-  const nLabelX = path.fromX + (path.midX - path.fromX) * 0.35;
-  const oneLabelX = path.toX + (path.midX - path.toX) * 0.35;
+  const manyKind = rel.manyKind || "zero-or-many";
+  const oneKind = rel.oneKind || "one";
+  const path = erdRelationshipPath(
+    fromNode,
+    rel.fromColumn,
+    toNode,
+    rel.toColumn,
+    erdMarkerDepth(manyKind),
+    erdMarkerDepth(oneKind)
+  );
+  const manyMarker = renderErdCardinalityMarker(path.fromX, path.fromY, path.fromToward, manyKind);
+  const oneMarker = renderErdCardinalityMarker(path.toX, path.toY, path.toToward, oneKind);
 
   return `<g class="erd-relationship" data-from="${escapeHtml(rel.fromTable)}" data-to="${escapeHtml(rel.toTable)}">
     <path d="${path.d}" class="erd-line" fill="none"></path>
-    <text class="erd-cardinality" x="${nLabelX}" y="${path.fromY - 8}">N</text>
-    <text class="erd-cardinality" x="${oneLabelX}" y="${path.toY - 8}">1</text>
+    ${manyMarker}
+    ${oneMarker}
   </g>`;
 }
 
