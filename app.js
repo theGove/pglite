@@ -27,6 +27,24 @@ let currentResultSets = [];
 let columnsCache = new Map();
 let dataLoadingDepth = 0;
 let unsubLeaderChange = null;
+/** @type {'results' | 'erd'} */
+let resultsViewMode = "results";
+let erdZoom = 1;
+/** @type {Map<string, { x: number, y: number }>} User-dragged ERD positions only. */
+let erdPositions = new Map();
+/** @type {{ nodes: Map<string, any>, relationships: Array<any> } | null} */
+let erdState = null;
+/** @type {{ tableName: string, offsetX: number, offsetY: number, pointerId: number } | null} */
+let erdDrag = null;
+/** @type {{ distance: number, zoom: number } | null} Active touch pinch session. */
+let erdPinch = null;
+/** @type {number | null} Zoom at the start of a Safari trackpad gesture. */
+let erdGestureStartZoom = null;
+/** @type {number | null} Index of the highlighted ERD relationship, or null. */
+let erdSelectedRelIndex = null;
+let lastResultsHtml = `<div class="empty-hint">Run a query to see results here.</div>`;
+let lastResultsMeta = "";
+let lastResultsClassName = "results-body";
 
 // ---- DOM refs -------------------------------------------------------------
 
@@ -55,6 +73,13 @@ const el = {
   tableList: document.getElementById("table-list"),
   resultsBody: document.getElementById("results-body"),
   resultsMeta: document.getElementById("results-meta"),
+  viewResults: document.getElementById("btn-view-results"),
+  viewErd: document.getElementById("btn-view-erd"),
+  erdToolbar: document.getElementById("erd-toolbar"),
+  erdZoomIn: document.getElementById("btn-erd-zoom-in"),
+  erdZoomOut: document.getElementById("btn-erd-zoom-out"),
+  erdZoomLabel: document.getElementById("erd-zoom-label"),
+  erdRefresh: document.getElementById("btn-erd-refresh"),
   statusText: document.getElementById("status-text"),
   loadingIndicator: document.getElementById("loading-indicator"),
   statusBar: document.getElementById("statusbar"),
@@ -529,20 +554,21 @@ async function runQuery() {
 
 function clearResults(message) {
   currentResultSets = [];
-  el.resultsBody.className = "results-body";
-  el.resultsBody.innerHTML = `<div class="empty-hint">${escapeHtml(message)}</div>`;
-  el.resultsMeta.textContent = "";
+  lastResultsHtml = `<div class="empty-hint">${escapeHtml(message)}</div>`;
+  lastResultsMeta = "";
+  lastResultsClassName = "results-body";
+  setResultsView("results");
 }
 
 function renderError(err) {
   currentResultSets = [];
-  el.resultsBody.className = "results-body has-error";
-  el.resultsBody.innerHTML = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
-  el.resultsMeta.textContent = "";
+  lastResultsHtml = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
+  lastResultsMeta = "";
+  lastResultsClassName = "results-body has-error";
+  setResultsView("results");
 }
 
 function renderResults(results, elapsedMs) {
-  el.resultsBody.className = "results-body";
   currentResultSets = results || [];
 
   if (!results || results.length === 0) {
@@ -566,10 +592,11 @@ function renderResults(results, elapsedMs) {
     return `<div class="result-block">${header}<div class="empty-hint">OK — ${affected} row(s) affected.</div></div>`;
   });
 
-  el.resultsBody.innerHTML = blocks.join("");
-
+  lastResultsHtml = blocks.join("");
   const totalRows = results.reduce((sum, r) => sum + (r.rows ? r.rows.length : 0), 0);
-  el.resultsMeta.textContent = `${totalRows} row(s) · ${elapsedMs} ms`;
+  lastResultsMeta = `${totalRows} row(s) · ${elapsedMs} ms`;
+  lastResultsClassName = "results-body";
+  setResultsView("results");
 }
 
 function isNumericValue(value) {
@@ -685,6 +712,10 @@ async function refreshTables() {
     el.tableList.querySelectorAll(".table-toggle").forEach((btn) => {
       btn.addEventListener("click", () => toggleTableColumns(btn));
     });
+
+    if (resultsViewMode === "erd") {
+      renderErd().catch(console.error);
+    }
   } catch (err) {
     console.error(err);
   }
@@ -737,6 +768,1053 @@ function renderColumns(container, columns) {
         `<div class="column-item"><span class="column-name">${escapeHtml(c.column_name)}</span><span>${escapeHtml(c.data_type)}</span></div>`
     )
     .join("");
+}
+
+// ---- ERD -------------------------------------------------------------------
+
+const ERD_NODE_WIDTH = 230;
+const ERD_HEADER_HEIGHT = 42;
+const ERD_ROW_HEIGHT = 22;
+const ERD_PAD_X = 48;
+const ERD_PAD_Y = 34;
+const ERD_GAP_X = 70;
+const ERD_GAP_Y = 48;
+const ERD_ZOOM_MIN = 0.5;
+const ERD_ZOOM_MAX = 2;
+const ERD_ZOOM_STEP = 0.1;
+const ERD_MIN_POS = 8;
+const ERD_CROWSFOOT_SPREAD = 7;
+const ERD_MARKER_CIRCLE_R = 3.5;
+
+/**
+ * Switches the bottom pane between query results and the ERD view.
+ * @param {'results' | 'erd'} mode
+ */
+function setResultsView(mode) {
+  resultsViewMode = mode;
+  const showingErd = mode === "erd";
+
+  el.viewResults.classList.toggle("is-active", !showingErd);
+  el.viewErd.classList.toggle("is-active", showingErd);
+  el.viewResults.setAttribute("aria-selected", String(!showingErd));
+  el.viewErd.setAttribute("aria-selected", String(showingErd));
+  el.erdToolbar.hidden = !showingErd;
+
+  if (showingErd) {
+    renderErd().catch((err) => {
+      console.error(err);
+      el.resultsBody.className = "results-body has-error";
+      el.resultsBody.innerHTML = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
+      el.resultsMeta.textContent = "";
+    });
+    return;
+  }
+
+  el.resultsBody.className = lastResultsClassName;
+  el.resultsBody.innerHTML = lastResultsHtml;
+  el.resultsMeta.textContent = lastResultsMeta;
+}
+
+/**
+ * Loads public tables, columns, primary keys, and foreign keys for the ERD.
+ */
+async function fetchErdSchema() {
+  const tablesRes = await pg.query(
+    `select table_name
+     from information_schema.tables
+     where table_schema = 'public' and table_type = 'BASE TABLE'
+     order by table_name;`
+  );
+
+  const columnsRes = await pg.query(
+    `select table_name, column_name, data_type, ordinal_position
+     from information_schema.columns
+     where table_schema = 'public'
+     order by table_name, ordinal_position;`
+  );
+
+  const pkRes = await pg.query(
+    `select kcu.table_name, kcu.column_name
+     from information_schema.table_constraints tc
+     join information_schema.key_column_usage kcu
+       on tc.constraint_schema = kcu.constraint_schema
+      and tc.constraint_name = kcu.constraint_name
+     where tc.constraint_type = 'PRIMARY KEY'
+       and tc.table_schema = 'public';`
+  );
+
+  const fkRes = await pg.query(
+    `select
+       kcu.table_name as from_table,
+       kcu.column_name as from_column,
+       ccu.table_name as to_table,
+       ccu.column_name as to_column,
+       col.is_nullable
+     from information_schema.table_constraints tc
+     join information_schema.key_column_usage kcu
+       on tc.constraint_schema = kcu.constraint_schema
+      and tc.constraint_name = kcu.constraint_name
+     join information_schema.referential_constraints rc
+       on tc.constraint_schema = rc.constraint_schema
+      and tc.constraint_name = rc.constraint_name
+     join information_schema.constraint_column_usage ccu
+       on rc.unique_constraint_schema = ccu.constraint_schema
+      and rc.unique_constraint_name = ccu.constraint_name
+     join information_schema.columns col
+       on col.table_schema = kcu.table_schema
+      and col.table_name = kcu.table_name
+      and col.column_name = kcu.column_name
+     where tc.constraint_type = 'FOREIGN KEY'
+       and tc.table_schema = 'public';`
+  );
+
+  const pkSet = new Set(pkRes.rows.map((r) => `${r.table_name}.${r.column_name}`));
+  const fkCols = new Set(fkRes.rows.map((r) => `${r.from_table}.${r.from_column}`));
+
+  /** @type {Map<string, { name: string, columns: Array<{ name: string, type: string, isPk: boolean, isFk: boolean }> }>} */
+  const tables = new Map();
+  for (const row of tablesRes.rows) {
+    tables.set(row.table_name, { name: row.table_name, columns: [] });
+  }
+  for (const row of columnsRes.rows) {
+    const table = tables.get(row.table_name);
+    if (!table) continue;
+    const key = `${row.table_name}.${row.column_name}`;
+    table.columns.push({
+      name: row.column_name,
+      type: formatErdType(row.data_type),
+      isPk: pkSet.has(key),
+      isFk: fkCols.has(key),
+    });
+  }
+
+  return {
+    tables: [...tables.values()],
+    relationships: fkRes.rows.map((r) => {
+      const fkOptional = r.is_nullable === "YES";
+      return {
+        fromTable: r.from_table,
+        fromColumn: r.from_column,
+        toTable: r.to_table,
+        toColumn: r.to_column,
+        // Child end: a parent may have zero children (FK cannot require children).
+        manyKind: "zero-or-many",
+        // Parent end: required parent if FK is NOT NULL, otherwise optional.
+        oneKind: fkOptional ? "zero-or-one" : "one",
+      };
+    }),
+  };
+}
+
+/**
+ * Shortens PostgreSQL data types for ERD labels.
+ * @param {string} dataType
+ */
+function formatErdType(dataType) {
+  const map = {
+    "character varying": "VARCHAR",
+    "timestamp with time zone": "TIMESTAMPTZ",
+    "timestamp without time zone": "TIMESTAMP",
+    "double precision": "FLOAT8",
+    integer: "INT",
+    bigint: "BIGINT",
+    smallint: "SMALLINT",
+    boolean: "BOOL",
+    text: "TEXT",
+    numeric: "NUMERIC",
+    real: "REAL",
+    date: "DATE",
+    uuid: "UUID",
+    json: "JSON",
+    jsonb: "JSONB",
+  };
+  return map[dataType] || String(dataType || "").toUpperCase();
+}
+
+/**
+ * Computes the rendered height of an ERD table card.
+ * @param {{ columns: unknown[] }} table
+ */
+function erdTableHeight(table) {
+  return ERD_HEADER_HEIGHT + Math.max(table.columns?.length || 0, 1) * ERD_ROW_HEIGHT + 8;
+}
+
+/**
+ * Assigns each table a horizontal layer (parents left, children right) from FK edges.
+ * @param {string[]} names
+ * @param {Array<{ fromTable: string, toTable: string }>} relationships
+ */
+function assignErdLayers(names, relationships) {
+  const nameSet = new Set(names);
+  /** @type {Map<string, string[]>} */
+  const childrenOf = new Map(names.map((n) => [n, []]));
+  /** @type {Map<string, string[]>} */
+  const parentsOf = new Map(names.map((n) => [n, []]));
+  /** @type {Map<string, number>} */
+  const indegree = new Map(names.map((n) => [n, 0]));
+
+  for (const rel of relationships) {
+    if (!nameSet.has(rel.fromTable) || !nameSet.has(rel.toTable)) continue;
+    if (rel.fromTable === rel.toTable) continue;
+    const parent = rel.toTable;
+    const child = rel.fromTable;
+    if (childrenOf.get(parent).includes(child)) continue;
+    childrenOf.get(parent).push(child);
+    parentsOf.get(child).push(parent);
+    indegree.set(child, indegree.get(child) + 1);
+  }
+
+  const queue = names.filter((n) => indegree.get(n) === 0);
+  const indeg = new Map(indegree);
+  const topo = [];
+  while (queue.length) {
+    const n = queue.shift();
+    topo.push(n);
+    for (const child of childrenOf.get(n)) {
+      indeg.set(child, indeg.get(child) - 1);
+      if (indeg.get(child) === 0) queue.push(child);
+    }
+  }
+  for (const n of names) {
+    if (!topo.includes(n)) topo.push(n);
+  }
+
+  /** @type {Map<string, number>} */
+  const layer = new Map();
+  for (const n of topo) {
+    const parents = parentsOf.get(n);
+    layer.set(n, parents.length ? Math.max(...parents.map((p) => layer.get(p) || 0)) + 1 : 0);
+  }
+
+  return { layer, childrenOf, parentsOf };
+}
+
+/**
+ * Orders tables within each layer to reduce relationship-line crossings.
+ * @param {string[]} names
+ * @param {Map<string, number>} layerMap
+ * @param {Map<string, string[]>} parentsOf
+ * @param {Map<string, string[]>} childrenOf
+ * @param {Array<{ fromTable: string, fromColumn: string, toTable: string }>} relationships
+ * @param {Array<{ name: string, columns: Array<{ name: string }> }>} tables
+ */
+function orderErdLayers(names, layerMap, parentsOf, childrenOf, relationships, tables) {
+  const maxLayer = names.reduce((max, n) => Math.max(max, layerMap.get(n) || 0), 0);
+  /** @type {string[][]} */
+  const layers = Array.from({ length: maxLayer + 1 }, () => []);
+  for (const n of names) layers[layerMap.get(n) || 0].push(n);
+  for (const group of layers) group.sort((a, b) => a.localeCompare(b));
+
+  /** @type {Map<string, Map<string, number>>} */
+  const columnIndex = new Map();
+  for (const table of tables) {
+    const cols = new Map();
+    (table.columns || []).forEach((col, idx) => cols.set(col.name, idx));
+    columnIndex.set(table.name, cols);
+  }
+
+  /**
+   * Average index of related tables in a neighboring layer.
+   * @param {string[]} related
+   * @param {string[]} neighbor
+   */
+  function barycenter(related, neighbor) {
+    const hits = related.filter((r) => neighbor.includes(r));
+    if (!hits.length) return neighbor.length / 2;
+    return hits.reduce((sum, r) => sum + neighbor.indexOf(r), 0) / hits.length;
+  }
+
+  /**
+   * Sort key for a parent using child positions and FK column order (reduces crossings).
+   * @param {string} parent
+   * @param {string[]} childLayer
+   */
+  function parentCrossingKey(parent, childLayer) {
+    const rels = relationships.filter(
+      (r) => r.toTable === parent && childLayer.includes(r.fromTable)
+    );
+    if (!rels.length) return barycenter(childrenOf.get(parent) || [], childLayer);
+    return (
+      rels.reduce((sum, r) => {
+        const childIdx = childLayer.indexOf(r.fromTable);
+        const colIdx = columnIndex.get(r.fromTable)?.get(r.fromColumn) ?? 0;
+        return sum + childIdx * 1000 + colIdx;
+      }, 0) / rels.length
+    );
+  }
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    for (let i = 1; i < layers.length; i += 1) {
+      layers[i].sort((a, b) => {
+        const diff =
+          barycenter(parentsOf.get(a) || [], layers[i - 1]) -
+          barycenter(parentsOf.get(b) || [], layers[i - 1]);
+        return diff || a.localeCompare(b);
+      });
+    }
+    for (let i = layers.length - 2; i >= 0; i -= 1) {
+      layers[i].sort((a, b) => {
+        const diff = parentCrossingKey(a, layers[i + 1]) - parentCrossingKey(b, layers[i + 1]);
+        return diff || a.localeCompare(b);
+      });
+    }
+  }
+
+  return layers;
+}
+
+/**
+ * Places layered tables left-to-right with parents before children.
+ * @param {Array<{ name: string, height: number }>} tables
+ * @param {string[][]} layers
+ */
+function placeErdLayers(tables, layers) {
+  const byName = new Map(tables.map((t) => [t.name, t]));
+  /** @type {Map<string, { x: number, y: number }>} */
+  const positions = new Map();
+
+  const layerHeights = layers.map((group) => {
+    if (!group.length) return 0;
+    return group.reduce((sum, name, idx) => {
+      const h = byName.get(name)?.height || ERD_HEADER_HEIGHT;
+      return sum + h + (idx > 0 ? ERD_GAP_Y : 0);
+    }, 0);
+  });
+  const tallest = Math.max(0, ...layerHeights);
+
+  let maxX = ERD_PAD_X;
+  let maxY = ERD_PAD_Y;
+
+  for (let li = 0; li < layers.length; li += 1) {
+    const group = layers[li];
+    if (!group.length) continue;
+    const x = ERD_PAD_X + li * (ERD_NODE_WIDTH + ERD_GAP_X);
+    let y = ERD_PAD_Y + Math.max(0, (tallest - layerHeights[li]) / 2);
+    for (const name of group) {
+      const table = byName.get(name);
+      positions.set(name, { x, y });
+      y += (table?.height || ERD_HEADER_HEIGHT) + ERD_GAP_Y;
+      maxX = Math.max(maxX, x + ERD_NODE_WIDTH);
+      maxY = Math.max(maxY, y - ERD_GAP_Y);
+    }
+  }
+
+  return { positions, maxX, maxY };
+}
+
+/**
+ * Lays out ERD tables using FK-aware layers so related tables sit cleanly
+ * side-by-side. Reuses any saved drag positions for tables the user moved.
+ * @param {Array<{ name: string, columns: unknown[] }>} tables
+ * @param {Array<{ fromTable: string, toTable: string }>} [relationships]
+ */
+function layoutErdNodes(tables, relationships = []) {
+  const prepared = tables.map((table) => ({
+    ...table,
+    height: erdTableHeight(table),
+  }));
+  const names = prepared.map((t) => t.name);
+  const linkedNames = new Set();
+  for (const rel of relationships) {
+    if (names.includes(rel.fromTable)) linkedNames.add(rel.fromTable);
+    if (names.includes(rel.toTable)) linkedNames.add(rel.toTable);
+  }
+  const linked = names.filter((n) => linkedNames.has(n));
+  const isolated = names.filter((n) => !linkedNames.has(n)).sort((a, b) => a.localeCompare(b));
+
+  /** @type {Map<string, { x: number, y: number }>} */
+  let autoPos = new Map();
+  let maxX = ERD_PAD_X;
+  let maxY = ERD_PAD_Y;
+
+  if (linked.length) {
+    const { layer, childrenOf, parentsOf } = assignErdLayers(linked, relationships);
+    const layers = orderErdLayers(
+      linked,
+      layer,
+      parentsOf,
+      childrenOf,
+      relationships,
+      prepared.filter((t) => linkedNames.has(t.name))
+    );
+    const placed = placeErdLayers(
+      prepared.filter((t) => linkedNames.has(t.name)),
+      layers
+    );
+    autoPos = placed.positions;
+    maxX = placed.maxX;
+    maxY = placed.maxY;
+  }
+
+  // Isolated tables sit in a tidy row beneath the linked diagram.
+  if (isolated.length) {
+    const startY = linked.length ? maxY + ERD_GAP_Y : ERD_PAD_Y;
+    let x = ERD_PAD_X;
+    let y = startY;
+    let rowMaxHeight = 0;
+    const colsPerRow = Math.max(1, Math.ceil(Math.sqrt(isolated.length)));
+    let col = 0;
+    for (const name of isolated) {
+      const table = prepared.find((t) => t.name === name);
+      const height = table?.height || ERD_HEADER_HEIGHT;
+      if (col >= colsPerRow) {
+        x = ERD_PAD_X;
+        y += rowMaxHeight + ERD_GAP_Y;
+        rowMaxHeight = 0;
+        col = 0;
+      }
+      autoPos.set(name, { x, y });
+      maxX = Math.max(maxX, x + ERD_NODE_WIDTH);
+      maxY = Math.max(maxY, y + height);
+      rowMaxHeight = Math.max(rowMaxHeight, height);
+      x += ERD_NODE_WIDTH + ERD_GAP_X;
+      col += 1;
+    }
+  }
+
+  const nodes = new Map();
+  const tableNames = new Set(prepared.map((t) => t.name));
+  for (const name of [...erdPositions.keys()]) {
+    if (!tableNames.has(name)) erdPositions.delete(name);
+  }
+
+  for (const table of prepared) {
+    const saved = erdPositions.get(table.name);
+    const auto = autoPos.get(table.name) || { x: ERD_PAD_X, y: ERD_PAD_Y };
+    const pos = saved || auto;
+    nodes.set(table.name, {
+      ...table,
+      x: pos.x,
+      y: pos.y,
+      width: ERD_NODE_WIDTH,
+    });
+    maxX = Math.max(maxX, pos.x + ERD_NODE_WIDTH);
+    maxY = Math.max(maxY, pos.y + table.height);
+  }
+
+  return {
+    nodes,
+    width: maxX + ERD_PAD_X,
+    height: maxY + ERD_PAD_Y,
+  };
+}
+
+/**
+ * Returns the vertical center of a column row inside a table node.
+ * @param {{ y: number, columns: Array<{ name: string }> }} node
+ * @param {string} columnName
+ */
+function erdColumnCenterY(node, columnName) {
+  const idx = node.columns.findIndex((c) => c.name === columnName);
+  const row = idx >= 0 ? idx : 0;
+  return node.y + ERD_HEADER_HEIGHT + row * ERD_ROW_HEIGHT + ERD_ROW_HEIGHT / 2;
+}
+
+/**
+ * Returns how far from the entity edge the relationship line should stop
+ * so it meets the innermost crow's foot symbol with no gap.
+ * @param {'zero-or-many' | 'one-or-many' | 'zero-or-one' | 'one'} kind
+ */
+function erdMarkerDepth(kind) {
+  if (kind === "one") return 12;
+  if (kind === "one-or-many") return 10;
+  if (kind === "zero-or-many" || kind === "zero-or-one") {
+    // Crowfoot/bar near entity, then circle; line meets the far edge of the circle.
+    return 8 + ERD_MARKER_CIRCLE_R * 2;
+  }
+  return 8 + ERD_MARKER_CIRCLE_R * 2;
+}
+
+/**
+ * Builds an SVG path for a relationship between two table sides.
+ * @param {{ x: number, y: number, width: number, height: number, columns: Array<{ name: string }> }} fromNode
+ * @param {string} fromColumn
+ * @param {{ x: number, y: number, width: number, height: number, columns: Array<{ name: string }> }} toNode
+ * @param {string} toColumn
+ * @param {number} fromDepth - Marker depth on the many (from) end.
+ * @param {number} toDepth - Marker depth on the one (to) end.
+ */
+function erdRelationshipPath(fromNode, fromColumn, toNode, toColumn, fromDepth, toDepth) {
+  const fromY = erdColumnCenterY(fromNode, fromColumn);
+  const toY = erdColumnCenterY(toNode, toColumn);
+  const fromCenterX = fromNode.x + fromNode.width / 2;
+  const toCenterX = toNode.x + toNode.width / 2;
+  const goRight = toCenterX >= fromCenterX;
+  const x1 = goRight ? fromNode.x + fromNode.width : fromNode.x;
+  const x2 = goRight ? toNode.x : toNode.x + toNode.width;
+  // Direction from the line toward each entity (horizontal).
+  const fromToward = goRight ? -1 : 1;
+  const toToward = goRight ? 1 : -1;
+  const fromLineX = x1 - fromToward * fromDepth;
+  const toLineX = x2 - toToward * toDepth;
+  const midX = (fromLineX + toLineX) / 2;
+  return {
+    d: `M ${fromLineX} ${fromY} C ${midX} ${fromY}, ${midX} ${toY}, ${toLineX} ${toY}`,
+    fromX: x1,
+    fromY,
+    toX: x2,
+    toY,
+    fromToward,
+    toToward,
+  };
+}
+
+/**
+ * Renders a crow's foot cardinality marker at a relationship endpoint.
+ * Outer symbol (nearest the entity) is maximum cardinality; inner is minimum.
+ * The relationship line is drawn to meet the innermost symbol edge.
+ * @param {number} x - Attachment x on the entity edge.
+ * @param {number} y - Attachment y on the entity edge.
+ * @param {number} towardEntity - Horizontal direction from line toward the entity (-1 or 1).
+ * @param {'zero-or-many' | 'one-or-many' | 'zero-or-one' | 'one'} kind - Full crow's foot cardinality.
+ */
+function renderErdCardinalityMarker(x, y, towardEntity, kind) {
+  const spread = ERD_CROWSFOOT_SPREAD;
+  const r = ERD_MARKER_CIRCLE_R;
+  const depth = erdMarkerDepth(kind);
+  /**
+   * X position measured outward from the entity edge toward the relationship line.
+   * @param {number} offset
+   */
+  const along = (offset) => x - towardEntity * offset;
+
+  const crowfoot = (tipOffset, heelOffset) => {
+    const tipX = along(tipOffset);
+    const heelX = along(heelOffset);
+    return `M ${heelX} ${y} L ${tipX} ${y - spread} M ${heelX} ${y} L ${tipX} ${y} M ${heelX} ${y} L ${tipX} ${y + spread}`;
+  };
+
+  const bar = (offset) => {
+    const bx = along(offset);
+    return `M ${bx} ${y - spread} L ${bx} ${y + spread}`;
+  };
+
+  const circleAt = (centerOffset) => {
+    const cx = along(centerOffset);
+    return `<circle class="erd-crowsfoot" cx="${cx}" cy="${y}" r="${r}"></circle>`;
+  };
+
+  if (kind === "zero-or-many") {
+    // Foot against the entity; circle touches the foot heel; line meets far circle edge.
+    const circleCenter = depth - r;
+    const footHeel = circleCenter - r;
+    return `${circleAt(circleCenter)}<path class="erd-crowsfoot" d="${crowfoot(0, footHeel)}"></path>`;
+  }
+  if (kind === "one-or-many") {
+    // Foot against the entity; mandatory bar at the line junction.
+    return `<path class="erd-crowsfoot" d="${bar(depth)} ${crowfoot(0, depth)}"></path>`;
+  }
+  if (kind === "zero-or-one") {
+    const circleCenter = depth - r;
+    return `${circleAt(circleCenter)}<path class="erd-crowsfoot" d="${bar(4)}"></path>`;
+  }
+  // one (one and only one): line meets the outer bar.
+  return `<path class="erd-crowsfoot" d="${bar(5)} ${bar(depth)}"></path>`;
+}
+
+/**
+ * Renders a key icon used for primary/foreign key columns.
+ * @param {number} x
+ * @param {number} y
+ * @param {boolean} isPrimary
+ */
+function erdKeyIcon(x, y, isPrimary) {
+  const cls = isPrimary ? "erd-key-primary" : "erd-key-muted";
+  return `<g class="${cls}" transform="translate(${x} ${y})">
+    <circle cx="4" cy="4" r="3.2" fill="none" stroke-width="1.5"></circle>
+    <path d="M 7 4 H 14 M 11 4 V 7 M 14 4 V 7" fill="none" stroke-width="1.5" stroke-linecap="round"></path>
+  </g>`;
+}
+
+/**
+ * Renders one table card for the ERD SVG.
+ * @param {{ name: string, x: number, y: number, width: number, height: number, columns: Array<{ name: string, type: string, isPk: boolean, isFk: boolean }> }} node
+ */
+function renderErdNode(node) {
+  const rows = node.columns.length
+    ? node.columns
+        .map((col, i) => {
+          const y = ERD_HEADER_HEIGHT + i * ERD_ROW_HEIGHT;
+          const textY = y + 15;
+          const classes = ["erd-column-row"];
+          if (col.isPk) classes.push("primary-key");
+          if (col.isFk) classes.push("foreign-key");
+          const key =
+            col.isPk || col.isFk
+              ? erdKeyIcon(node.width - 44, y + 6, col.isPk)
+              : "";
+          return `<g class="${classes.join(" ")}">
+            <text x="16" y="${textY}" class="erd-column-text">${escapeHtml(col.name)}<tspan class="erd-column-type"> - ${escapeHtml(col.type)}</tspan></text>
+            ${key}
+          </g>`;
+        })
+        .join("")
+    : `<text x="16" y="${ERD_HEADER_HEIGHT + 15}" class="erd-column-type">(no columns)</text>`;
+
+  return `<g class="erd-node" data-table="${escapeHtml(node.name)}" transform="translate(${node.x} ${node.y})">
+    <rect width="${node.width}" height="${node.height}" rx="8" class="erd-node-body"></rect>
+    <rect width="${node.width}" height="${ERD_HEADER_HEIGHT}" rx="8" class="erd-node-header"></rect>
+    <path d="M 0 34 H ${node.width} V ${ERD_HEADER_HEIGHT} H 0 Z" class="erd-node-header"></path>
+    <text x="16" y="26" class="erd-node-title">${escapeHtml(node.name)}</text>
+    ${rows}
+  </g>`;
+}
+
+/**
+ * Renders a relationship line using crow's foot notation with min/max cardinality.
+ * @param {{ fromTable: string, fromColumn: string, toTable: string, toColumn: string, manyKind: string, oneKind: string }} rel
+ * @param {Map<string, any>} nodes
+ * @param {number} index - Relationship index used for selection.
+ */
+function renderErdRelationship(rel, nodes, index) {
+  const fromNode = nodes.get(rel.fromTable);
+  const toNode = nodes.get(rel.toTable);
+  if (!fromNode || !toNode) return "";
+
+  const manyKind = rel.manyKind || "zero-or-many";
+  const oneKind = rel.oneKind || "one";
+  const path = erdRelationshipPath(
+    fromNode,
+    rel.fromColumn,
+    toNode,
+    rel.toColumn,
+    erdMarkerDepth(manyKind),
+    erdMarkerDepth(oneKind)
+  );
+  const manyMarker = renderErdCardinalityMarker(path.fromX, path.fromY, path.fromToward, manyKind);
+  const oneMarker = renderErdCardinalityMarker(path.toX, path.toY, path.toToward, oneKind);
+  const selected = erdSelectedRelIndex === index ? " is-selected" : "";
+
+  return `<g class="erd-relationship${selected}" data-rel-index="${index}" data-from="${escapeHtml(rel.fromTable)}" data-to="${escapeHtml(rel.toTable)}">
+    <path d="${path.d}" class="erd-line-hit" fill="none"></path>
+    <path d="${path.d}" class="erd-line" fill="none"></path>
+    ${manyMarker}
+    ${oneMarker}
+  </g>`;
+}
+
+/**
+ * Highlights a relationship by index, or clears the highlight when null.
+ * @param {number | null} index
+ */
+function selectErdRelationship(index) {
+  erdSelectedRelIndex = index;
+  const group = el.resultsBody.querySelector("#erd-relationships");
+  if (!group) return;
+
+  group.querySelectorAll(".erd-relationship.is-selected").forEach((relEl) => {
+    relEl.classList.remove("is-selected");
+  });
+
+  if (index == null) return;
+
+  const selected = group.querySelector(`.erd-relationship[data-rel-index="${index}"]`);
+  if (!selected) {
+    erdSelectedRelIndex = null;
+    return;
+  }
+  selected.classList.add("is-selected");
+  group.appendChild(selected);
+}
+
+/**
+ * Converts a pointer event into ERD diagram coordinates (accounts for scroll + zoom).
+ * @param {PointerEvent} event
+ */
+function pointerToErdCoords(event) {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!scroll) return { x: 0, y: 0 };
+  const rect = scroll.getBoundingClientRect();
+  return {
+    x: (event.clientX - rect.left + scroll.scrollLeft) / erdZoom,
+    y: (event.clientY - rect.top + scroll.scrollTop) / erdZoom,
+  };
+}
+
+/**
+ * Expands the SVG canvas so dragged tables stay inside the scrollable area.
+ */
+function syncErdCanvasSize() {
+  if (!erdState) return;
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!svg || !scroll) return;
+
+  let maxX = 0;
+  let maxY = 0;
+  for (const node of erdState.nodes.values()) {
+    maxX = Math.max(maxX, node.x + node.width);
+    maxY = Math.max(maxY, node.y + node.height);
+  }
+
+  const width = Math.max(Math.ceil(maxX + ERD_PAD_X), Math.ceil(scroll.clientWidth / erdZoom));
+  const height = Math.max(Math.ceil(maxY + ERD_PAD_Y), Math.ceil(scroll.clientHeight / erdZoom));
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.style.width = `${width}px`;
+  svg.style.height = `${height}px`;
+}
+
+/**
+ * Redraws relationship lines from the current node positions.
+ */
+function updateErdRelationships() {
+  if (!erdState) return;
+  const group = el.resultsBody.querySelector("#erd-relationships");
+  if (!group) return;
+  group.innerHTML = erdState.relationships
+    .map((rel, index) => renderErdRelationship(rel, erdState.nodes, index))
+    .join("");
+  selectErdRelationship(erdSelectedRelIndex);
+}
+
+/**
+ * Attaches click handlers so relationship lines can be highlighted.
+ */
+function bindErdRelationshipHandlers() {
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  if (!svg || svg.dataset.relClickBound === "1") return;
+  svg.dataset.relClickBound = "1";
+
+  svg.addEventListener("click", (event) => {
+    if (erdDrag) return;
+    const relEl = event.target.closest(".erd-relationship");
+    if (relEl) {
+      const index = Number(relEl.getAttribute("data-rel-index"));
+      if (!Number.isFinite(index)) return;
+      selectErdRelationship(erdSelectedRelIndex === index ? null : index);
+      event.stopPropagation();
+      return;
+    }
+    selectErdRelationship(null);
+  });
+}
+
+/**
+ * Finds the SVG group for a table card by table name.
+ * @param {string} tableName
+ */
+function findErdNodeEl(tableName) {
+  return [...el.resultsBody.querySelectorAll(".erd-node")].find(
+    (nodeEl) => nodeEl.getAttribute("data-table") === tableName
+  );
+}
+
+/**
+ * Moves a table node in the diagram and updates connected relationship lines.
+ * @param {string} tableName
+ * @param {number} x
+ * @param {number} y
+ */
+function moveErdNode(tableName, x, y) {
+  if (!erdState) return;
+  const node = erdState.nodes.get(tableName);
+  if (!node) return;
+
+  node.x = Math.max(ERD_MIN_POS, x);
+  node.y = Math.max(ERD_MIN_POS, y);
+  erdPositions.set(tableName, { x: node.x, y: node.y });
+
+  const nodeEl = findErdNodeEl(tableName);
+  if (nodeEl) nodeEl.setAttribute("transform", `translate(${node.x} ${node.y})`);
+
+  updateErdRelationships();
+  syncErdCanvasSize();
+}
+
+/**
+ * Starts dragging an ERD table card.
+ * @param {PointerEvent} event
+ * @param {SVGGElement} nodeEl
+ */
+function startErdDrag(event, nodeEl) {
+  if (event.button !== 0 || !erdState) return;
+  const tableName = nodeEl.getAttribute("data-table");
+  const node = tableName ? erdState.nodes.get(tableName) : null;
+  if (!tableName || !node) return;
+
+  const point = pointerToErdCoords(event);
+  erdDrag = {
+    tableName,
+    offsetX: point.x - node.x,
+    offsetY: point.y - node.y,
+    pointerId: event.pointerId,
+  };
+
+  nodeEl.classList.add("is-dragging");
+  nodeEl.parentNode.appendChild(nodeEl);
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (scroll) scroll.classList.add("is-dragging");
+  nodeEl.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+/**
+ * Continues an active ERD table drag.
+ * @param {PointerEvent} event
+ */
+function onErdPointerMove(event) {
+  if (!erdDrag || event.pointerId !== erdDrag.pointerId) return;
+  const point = pointerToErdCoords(event);
+  moveErdNode(erdDrag.tableName, point.x - erdDrag.offsetX, point.y - erdDrag.offsetY);
+}
+
+/**
+ * Ends an active ERD table drag.
+ * @param {PointerEvent} event
+ */
+function endErdDrag(event) {
+  if (!erdDrag || event.pointerId !== erdDrag.pointerId) return;
+  const nodeEl = findErdNodeEl(erdDrag.tableName);
+  if (nodeEl) nodeEl.classList.remove("is-dragging");
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (scroll) scroll.classList.remove("is-dragging");
+  erdDrag = null;
+}
+
+/**
+ * Attaches pointer listeners so ERD table cards can be dragged.
+ */
+function bindErdDragHandlers() {
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  if (!svg) return;
+
+  svg.querySelectorAll(".erd-node").forEach((nodeEl) => {
+    nodeEl.addEventListener("pointerdown", (event) => startErdDrag(event, nodeEl));
+    nodeEl.addEventListener("pointermove", onErdPointerMove);
+    nodeEl.addEventListener("pointerup", endErdDrag);
+    nodeEl.addEventListener("pointercancel", endErdDrag);
+  });
+}
+
+/**
+ * Applies the current ERD zoom to the SVG and label.
+ */
+function applyErdZoom() {
+  const svg = el.resultsBody.querySelector(".erd-svg");
+  if (svg) svg.style.transform = `scale(${erdZoom})`;
+  el.erdZoomLabel.textContent = `${Math.round(erdZoom * 100)}%`;
+  syncErdCanvasSize();
+}
+
+/**
+ * Clamps an ERD zoom factor to the allowed range.
+ * @param {number} zoom
+ */
+function clampErdZoom(zoom) {
+  return Math.min(ERD_ZOOM_MAX, Math.max(ERD_ZOOM_MIN, zoom));
+}
+
+/**
+ * Zooms the ERD toward a viewport point so that point stays under the cursor/fingers.
+ * @param {number} clientX - Focal X in viewport coordinates.
+ * @param {number} clientY - Focal Y in viewport coordinates.
+ * @param {number} nextZoom - Desired zoom factor before clamping.
+ */
+function setErdZoomAt(clientX, clientY, nextZoom) {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!scroll) {
+    erdZoom = clampErdZoom(nextZoom);
+    applyErdZoom();
+    return;
+  }
+
+  const zoom = clampErdZoom(nextZoom);
+  if (zoom === erdZoom) {
+    applyErdZoom();
+    return;
+  }
+
+  const rect = scroll.getBoundingClientRect();
+  const contentX = (clientX - rect.left + scroll.scrollLeft) / erdZoom;
+  const contentY = (clientY - rect.top + scroll.scrollTop) / erdZoom;
+
+  erdZoom = zoom;
+  applyErdZoom();
+
+  scroll.scrollLeft = contentX * erdZoom - (clientX - rect.left);
+  scroll.scrollTop = contentY * erdZoom - (clientY - rect.top);
+}
+
+/**
+ * Changes ERD zoom by a delta and clamps to min/max, centered in the viewport.
+ * @param {number} delta
+ */
+function changeErdZoom(delta) {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  const nextZoom = Math.round((erdZoom + delta) * 10) / 10;
+  if (!scroll) {
+    erdZoom = clampErdZoom(nextZoom);
+    applyErdZoom();
+    return;
+  }
+  const rect = scroll.getBoundingClientRect();
+  setErdZoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, nextZoom);
+}
+
+/**
+ * Clears any active ERD table drag (used when a pinch starts).
+ */
+function cancelErdDrag() {
+  if (!erdDrag) return;
+  const nodeEl = findErdNodeEl(erdDrag.tableName);
+  if (nodeEl) nodeEl.classList.remove("is-dragging");
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (scroll) scroll.classList.remove("is-dragging");
+  erdDrag = null;
+}
+
+/**
+ * Starts an ERD pinch session from a two-finger touch.
+ * @param {TouchEvent} event
+ */
+function onErdTouchStart(event) {
+  if (event.touches.length !== 2) {
+    if (event.touches.length < 2) erdPinch = null;
+    return;
+  }
+  cancelErdDrag();
+  const a = event.touches[0];
+  const b = event.touches[1];
+  const distance = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+  if (distance < 8) return;
+  erdPinch = { distance, zoom: erdZoom };
+}
+
+/**
+ * Continues an ERD pinch-zoom toward the midpoint between fingers.
+ * @param {TouchEvent} event
+ */
+function onErdTouchMove(event) {
+  if (event.touches.length !== 2 || !erdPinch) return;
+  event.preventDefault();
+  const a = event.touches[0];
+  const b = event.touches[1];
+  const distance = Math.hypot(b.clientX - a.clientX, b.clientY - a.clientY);
+  if (distance < 8) return;
+  setErdZoomAt(
+    (a.clientX + b.clientX) / 2,
+    (a.clientY + b.clientY) / 2,
+    erdPinch.zoom * (distance / erdPinch.distance)
+  );
+}
+
+/**
+ * Ends an ERD pinch session when fewer than two fingers remain.
+ * @param {TouchEvent} event
+ */
+function onErdTouchEnd(event) {
+  if (event.touches.length < 2) erdPinch = null;
+}
+
+/**
+ * Zooms the ERD for trackpad pinch (ctrl+wheel) toward the cursor.
+ * @param {WheelEvent} event
+ */
+function onErdWheelZoom(event) {
+  if (!event.ctrlKey && !event.metaKey) return;
+  event.preventDefault();
+  const factor = Math.exp(-event.deltaY * 0.01);
+  setErdZoomAt(event.clientX, event.clientY, erdZoom * factor);
+}
+
+/**
+ * Starts a Safari trackpad pinch gesture.
+ * @param {Event} event
+ */
+function onErdGestureStart(event) {
+  event.preventDefault();
+  erdGestureStartZoom = erdZoom;
+}
+
+/**
+ * Continues a Safari trackpad pinch gesture toward the cursor.
+ * @param {Event & { scale?: number, clientX?: number, clientY?: number }} event
+ */
+function onErdGestureChange(event) {
+  event.preventDefault();
+  if (erdGestureStartZoom == null || typeof event.scale !== "number") return;
+  const clientX = typeof event.clientX === "number" ? event.clientX : 0;
+  const clientY = typeof event.clientY === "number" ? event.clientY : 0;
+  setErdZoomAt(clientX, clientY, erdGestureStartZoom * event.scale);
+}
+
+/**
+ * Ends a Safari trackpad pinch gesture.
+ * @param {Event} event
+ */
+function onErdGestureEnd(event) {
+  event.preventDefault();
+  erdGestureStartZoom = null;
+}
+
+/**
+ * Attaches pinch and trackpad zoom listeners to the ERD scroll container.
+ */
+function bindErdZoomHandlers() {
+  const scroll = el.resultsBody.querySelector(".erd-scroll");
+  if (!scroll) return;
+
+  erdPinch = null;
+  erdGestureStartZoom = null;
+
+  scroll.addEventListener("touchstart", onErdTouchStart, { passive: true });
+  scroll.addEventListener("touchmove", onErdTouchMove, { passive: false });
+  scroll.addEventListener("touchend", onErdTouchEnd);
+  scroll.addEventListener("touchcancel", onErdTouchEnd);
+  scroll.addEventListener("wheel", onErdWheelZoom, { passive: false });
+  scroll.addEventListener("gesturestart", onErdGestureStart);
+  scroll.addEventListener("gesturechange", onErdGestureChange);
+  scroll.addEventListener("gestureend", onErdGestureEnd);
+}
+
+/**
+ * Fetches schema metadata and renders an ERD into the results pane.
+ */
+async function renderErd() {
+  if (!pg) return;
+
+  erdDrag = null;
+  erdPinch = null;
+  erdGestureStartZoom = null;
+  erdSelectedRelIndex = null;
+  erdState = null;
+  el.resultsBody.className = "results-body erd-body";
+  el.resultsBody.innerHTML = `<div class="empty-hint">Loading ERD…</div>`;
+  el.resultsMeta.textContent = "";
+
+  const schema = await fetchErdSchema();
+  if (!schema.tables.length) {
+    el.resultsBody.innerHTML = `<div class="empty-hint">No tables yet. Create or upload tables to see an ERD.</div>`;
+    el.resultsMeta.textContent = "0 tables";
+    return;
+  }
+
+  const { nodes, width, height } = layoutErdNodes(schema.tables, schema.relationships);
+  erdState = { nodes, relationships: schema.relationships };
+
+  const relationshipsSvg = schema.relationships
+    .map((rel, index) => renderErdRelationship(rel, nodes, index))
+    .join("");
+  const nodesSvg = [...nodes.values()].map((node) => renderErdNode(node)).join("");
+
+  el.resultsBody.innerHTML = `
+    <div class="erd-scroll">
+      <svg class="erd-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
+           role="group" aria-label="Interactive entity relationship diagram"
+           style="width: ${width}px; height: ${height}px; transform: scale(${erdZoom});">
+        <g id="erd-relationships">${relationshipsSvg}</g>
+        <g id="erd-nodes">${nodesSvg}</g>
+      </svg>
+    </div>`;
+
+  const relCount = schema.relationships.length;
+  el.resultsMeta.textContent = `${schema.tables.length} table(s) · ${relCount} relationship(s)`;
+  bindErdDragHandlers();
+  bindErdRelationshipHandlers();
+  bindErdZoomHandlers();
+  applyErdZoom();
 }
 
 // ---- Upload / Download -----------------------------------------------------
@@ -1321,6 +2399,14 @@ function initEventListeners() {
   });
 
   el.refreshTables.addEventListener("click", () => refreshTables());
+
+  el.viewResults.addEventListener("click", () => setResultsView("results"));
+  el.viewErd.addEventListener("click", () => setResultsView("erd"));
+  el.erdZoomIn.addEventListener("click", () => changeErdZoom(ERD_ZOOM_STEP));
+  el.erdZoomOut.addEventListener("click", () => changeErdZoom(-ERD_ZOOM_STEP));
+  el.erdRefresh.addEventListener("click", () => {
+    if (resultsViewMode === "erd") renderErd().catch(console.error);
+  });
 
   el.toggleSidebar.addEventListener("click", () => {
     const collapsed = el.sidebar.classList.toggle("collapsed");

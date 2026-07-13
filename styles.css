@@ -15,6 +15,15 @@
   --mono: "SF Mono", "Cascadia Code", Consolas, "Courier New", monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --radius: 8px;
+  --erd-bg: #fbfdff;
+  --erd-grid: #edf2f7;
+  --erd-node-bg: #ffffff;
+  --erd-node-border: #cbd4e1;
+  --erd-header: #204f66;
+  --erd-text: #1e293b;
+  --erd-muted: #748094;
+  --erd-key: #1f6f78;
+  --erd-line: #687487;
 }
 
 :root[data-theme="dark"] {
@@ -31,6 +40,15 @@
   --danger-tint: #3a2323;
   --danger-border: #5a2e2e;
   --danger-text: #ff9b9b;
+  --erd-bg: #1a1d24;
+  --erd-grid: #2a2f3a;
+  --erd-node-bg: #22252c;
+  --erd-node-border: #3a404c;
+  --erd-header: #2f6f8f;
+  --erd-text: #e7e9ee;
+  --erd-muted: #8b95a8;
+  --erd-key: #6ec4cf;
+  --erd-line: #8b95a8;
 }
 
 * {
@@ -686,4 +704,175 @@ table.result-table tbody tr:hover {
   height: 26px;
   border-width: 3px;
   flex: 0 0 auto;
+}
+
+/* Results / ERD view tabs */
+
+.results-view-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.results-view-tab {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.results-view-tab:hover {
+  color: var(--text);
+  background: var(--hover-bg);
+}
+
+.results-view-tab.is-active {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+.erd-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 4px;
+}
+
+.erd-toolbar[hidden] {
+  display: none;
+}
+
+.erd-zoom-label {
+  min-width: 42px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.results-body.erd-body {
+  padding: 0;
+  overflow: hidden;
+}
+
+.erd-scroll {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  /* Allow one-finger pan; custom JS handles two-finger pinch zoom. */
+  touch-action: pan-x pan-y;
+  background:
+    radial-gradient(circle, var(--erd-grid) 1.25px, transparent 1.3px) 0 0 / 20px 20px,
+    var(--erd-bg);
+}
+
+.erd-scroll.is-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.erd-svg {
+  display: block;
+  transform-origin: 0 0;
+  max-width: none;
+  max-height: none;
+}
+
+.erd-node {
+  cursor: grab;
+  touch-action: none;
+}
+
+.erd-node.is-dragging {
+  cursor: grabbing;
+}
+
+.erd-node-body {
+  fill: var(--erd-node-bg);
+  stroke: var(--erd-node-border);
+}
+
+.erd-node-header {
+  fill: var(--erd-header);
+}
+
+.erd-node-title {
+  fill: #fff;
+  font-size: 15px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.erd-column-text {
+  fill: var(--erd-text);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.erd-column-row.primary-key .erd-column-text {
+  font-weight: 800;
+}
+
+.erd-column-row.foreign-key .erd-column-text {
+  font-style: italic;
+}
+
+.erd-column-type {
+  fill: var(--erd-muted);
+  font-style: normal;
+  font-weight: 600;
+}
+
+.erd-key-primary {
+  stroke: var(--erd-key);
+}
+
+.erd-key-muted {
+  stroke: var(--erd-muted);
+  opacity: 0.85;
+}
+
+.erd-relationship {
+  cursor: pointer;
+}
+
+.erd-line-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  stroke-linecap: round;
+  pointer-events: stroke;
+}
+
+.erd-line {
+  stroke: var(--erd-line);
+  stroke-width: 2;
+  stroke-linecap: butt;
+  pointer-events: none;
+}
+
+.erd-crowsfoot {
+  fill: none;
+  stroke: var(--erd-line);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: stroke;
+}
+
+.erd-relationship.is-selected .erd-line,
+.erd-relationship.is-selected .erd-crowsfoot {
+  stroke: var(--accent);
+  stroke-width: 3;
 }
