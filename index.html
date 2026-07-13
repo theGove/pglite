@@ -20,10 +20,6 @@
     </div>
 
     <div class="toolbar">
-      <button id="btn-run" class="btn btn-primary" title="Run query (Ctrl/Cmd+Enter)">
-        <span class="icon">▶</span> Run
-      </button>
-      <span class="divider"></span>
       <div class="menu" id="menu">
         <button id="btn-menu" class="btn icon-btn-lg" title="Database actions" aria-haspopup="true" aria-expanded="false">☰</button>
         <div id="menu-panel" class="menu-panel" hidden>
@@ -84,6 +80,9 @@
         <div class="results-header">
           <span id="results-title">Results</span>
           <span id="results-meta" class="results-meta"></span>
+          <button id="btn-run" class="btn btn-primary results-header-run" title="Run query (Ctrl/Cmd+Enter)">
+            <span class="icon">▶</span> Run
+          </button>
         </div>
         <div id="results-body" class="results-body">
           <div class="empty-hint">Run a query to see results here.</div>
@@ -104,6 +103,16 @@
   </footer>
 
   <div id="toast" class="toast" hidden></div>
+
+  <div id="db-loading-overlay" class="loading-overlay" hidden>
+    <div class="loading-dialog" role="alertdialog" aria-live="assertive" aria-busy="true">
+      <span class="spinner spinner-lg" aria-hidden="true"></span>
+      <div class="loading-dialog-text">
+        <div class="loading-dialog-title" id="db-loading-title">Loading database…</div>
+        <div class="loading-dialog-subtitle" id="db-loading-subtitle">This may take a moment on first load.</div>
+      </div>
+    </div>
+  </div>
 
 </body>
 </html>
