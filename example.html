@@ -126,7 +126,7 @@
       <h2>Frame A — write</h2>
       <iframe
         title="WebSQL Studio frame A"
-        src="index.html?shared=1&sql=-- Frame A: create shared data, then Run.%0Acreate table if not exists demo_shared (%0A  id serial primary key,%0A  note text,%0A  created_at timestamptz default now()%0A);%0A%0Ainsert into demo_shared (note) values ('hello from frame A');%0A%0Aselect * from demo_shared order by id;"
+        src="https://www.websql.org/?shared=1&sql=-- Frame A: create shared data, then Run.%0Acreate table if not exists demo_shared (%0A  id serial primary key,%0A  note text,%0A  created_at timestamptz default now()%0A);%0A%0Ainsert into demo_shared (note) values ('hello from frame A');%0A%0Aselect * from demo_shared order by id;"
       ></iframe>
     </section>
 
@@ -134,7 +134,7 @@
       <h2>Frame B — read</h2>
       <iframe
         title="WebSQL Studio frame B"
-        src="index.html?shared=1&sql=-- Frame B: after Frame A runs, click Run here.%0A-- You should see demo_shared without loading data again.%0A%0Aselect * from demo_shared order by id;%0A%0A-- Or list tables:%0A-- \\dt"
+        src="https://www.websql.org/?shared=1&sql=-- Frame B: after Frame A runs, click Run here.%0A-- You should see demo_shared without loading data again.%0A%0Aselect * from demo_shared order by id;%0A%0A-- Or list tables:%0A-- \\dt"
       ></iframe>
     </section>
   </div>
