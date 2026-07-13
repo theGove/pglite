@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Push index.html / styles.css / app.js / pglite-worker.js to their Blogger posts.
+"""Push index.html / styles.css / app.js to their Blogger posts.
 
 Usage:
     python sync_to_blogger.py                # publish all registered assets
@@ -19,9 +19,6 @@ POSTS = {
     "app.js": ("193744643460984257", ROOT / "app.js"),
     "styles.css": ("3605221917047497476", ROOT / "styles.css"),
     "index.html": ("8271236875667927124", ROOT / "index.html"),
-    # Same-origin module worker required by app.js (`new Worker("./pglite-worker.js")`).
-    # Create a Blogger post that stores the raw file contents, then put its post ID here.
-    "pglite-worker.js": (None, ROOT / "pglite-worker.js"),
 }
 
 

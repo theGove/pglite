@@ -208,6 +208,27 @@ async function loadPGliteWorker() {
 }
 
 /**
+ * Creates a module Worker from an inlined Blob URL (no separate worker file).
+ */
+function createPGliteBlobWorker() {
+  const source = `
+import { PGlite } from ${JSON.stringify(PGLITE_URL)};
+import { worker } from ${JSON.stringify(PGLITE_WORKER_URL)};
+
+worker({
+  async init(options) {
+    return new PGlite({
+      dataDir: options.dataDir,
+      loadDataDir: options.loadDataDir,
+    });
+  },
+});
+`;
+  const blob = new Blob([source], { type: "text/javascript" });
+  return new Worker(URL.createObjectURL(blob), { type: "module" });
+}
+
+/**
  * Creates a database: private in-memory PGlite by default, or a shared
  * PGliteWorker + IndexedDB instance when ?shared=1 is present.
  * @param {{ loadDataDir?: Blob | File }} [options] - Extra PGlite options (e.g. tarball load).
@@ -215,7 +236,7 @@ async function loadPGliteWorker() {
 async function createDatabase(options = {}) {
   if (useSharedDb) {
     const PGliteWorker = await loadPGliteWorker();
-    return PGliteWorker.create(new Worker("./pglite-worker.js", { type: "module" }), {
+    return PGliteWorker.create(createPGliteBlobWorker(), {
       id: DB_ID,
       dataDir: DATA_DIR,
       ...options,
