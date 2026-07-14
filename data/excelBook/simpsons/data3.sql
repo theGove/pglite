@@ -1533,3 +1533,8 @@ update credit set role = 'voice' where role = 'e7';
 update credit set role = 'writer' where role = 'e9';
 update credit set role = 'writing contribution' where role = 'e;';
 update credit set role = 'written by and' where role = 'e=';
+
+-- Revert back to normal origin behavior
+SET session_replication_role = 'origin';
+
+COMMIT;

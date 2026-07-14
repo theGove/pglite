@@ -10,6 +10,8 @@ const DATA_DIR = `idb://${DB_ID}`;
 /** Enable multi-tab shared DB with ?shared=1 */
 const SHARED_DB_PARAM = "shared";
 const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
+/** Enables admin-only ERD tooling with ?mode=admin */
+const isAdminMode = new URLSearchParams(window.location.search).get("mode") === "admin";
 const DEFAULT_DB_LABEL = useSharedDb ? DATA_DIR : "in-memory";
 
 const DEFAULT_SQL = `-- Welcome to WebSQL Studio, running PostgreSQL Lite (PGlite).
@@ -80,6 +82,7 @@ const el = {
   erdZoomOut: document.getElementById("btn-erd-zoom-out"),
   erdZoomLabel: document.getElementById("erd-zoom-label"),
   erdRefresh: document.getElementById("btn-erd-refresh"),
+  erdLogPositions: document.getElementById("btn-erd-log-positions"),
   statusText: document.getElementById("status-text"),
   loadingIndicator: document.getElementById("loading-indicator"),
   statusBar: document.getElementById("statusbar"),
@@ -94,6 +97,7 @@ const el = {
 
 applyTheme(getPreferredTheme());
 setStatusBarVisible(false);
+el.erdLogPositions.hidden = !isAdminMode;
 
 // ---- Small UI helpers -----------------------------------------------------
 
@@ -1524,6 +1528,37 @@ function moveErdNode(tableName, x, y) {
 }
 
 /**
+ * Logs the current ERD table positions as a JSON object of
+ * `{ [tableName]: { x, y } }`, keyed the same way `applyErdTablePositions`
+ * expects to receive them back.
+ */
+function logErdTablePositions() {
+  if (!erdState) return null;
+  const positions = {};
+  for (const [name, node] of erdState.nodes) {
+    positions[name] = { x: node.x, y: node.y };
+  }
+  console.log(JSON.stringify(positions, null, 2));
+  return positions;
+}
+
+/**
+ * Positions ERD tables from an object shaped like `{ [tableName]: { x, y } }`
+ * (as produced by `logErdTablePositions`) and re-renders the diagram.
+ * @param {Record<string, { x: number, y: number }>} positions
+ */
+function applyErdTablePositions(positions) {
+  if (!positions || typeof positions !== "object") return;
+  for (const [name, pos] of Object.entries(positions)) {
+    if (pos && typeof pos.x === "number" && typeof pos.y === "number") {
+      erdPositions.set(name, { x: pos.x, y: pos.y });
+    }
+  }
+  if (resultsViewMode === "erd") renderErd().catch(console.error);
+}
+window.applyErdTablePositions = applyErdTablePositions;
+
+/**
  * Starts dragging an ERD table card.
  * @param {PointerEvent} event
  * @param {SVGGElement} nodeEl
@@ -2075,14 +2110,20 @@ function base64ToBytes(base64) {
 // Fetch every URL in `urls` in parallel, then assemble them in listed order
 // (positional, regardless of which fetch actually resolved first) and hand
 // the result to handleUpload() exactly as if it had been picked via "Upload DB".
-async function loadDataFromUrls(label, urls) {
+async function loadDataFromUrls(label, urls, erd_url) {
   setBusy(true);
   setDataLoading(true, `Fetching "${label}"…`);
   setStatus(`Fetching "${label}"…`);
   try {
-    const resolvedPieces = await Promise.all(
-      urls.map((url, index) => fetchDataPiece(url).then((piece) => ({ index, piece })))
-    );
+    const [resolvedPieces, erdLayout] = await Promise.all([
+      Promise.all(urls.map((url, index) => fetchDataPiece(url).then((piece) => ({ index, piece })))),
+      erd_url
+        ? fetch(erd_url).then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status} for ${erd_url}`);
+            return response.json();
+          })
+        : Promise.resolve(null),
+    ]);
     const pieces = resolvedPieces
       .sort((a, b) => a.index - b.index)
       .map((entry) => entry.piece);
@@ -2100,10 +2141,11 @@ async function loadDataFromUrls(label, urls) {
         : new File([combinedText], `${label}.sql`, { type: "text/plain" });
     }
     console.log("urls",urls)
-    console.log("pieces",pieces)
+    console.log("erdLayout",erdLayout,erdLayout.feed.entry[0].content.$t)
     await wipeCurrentDatabaseStore();
     await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
     await handleUpload(file);
+    if (erdLayout) applyErdTablePositions(JSON.parse(erdLayout.feed.entry[0].content.$t));
     runQuery()
   } catch (err) {
     console.error(err);
@@ -2118,8 +2160,9 @@ async function loadDataFromUrls(label, urls) {
 // Register an entry in the "Load Data" submenu. `label` is the text shown to
 // the user; `url` is a relative path (or an array of them, fetched in
 // parallel and assembled in listed order) handed to handleUpload() exactly
-// as if that data had been picked via "Upload DB".
-function addLoadDataOption(label, url) {
+// as if that data had been picked via "Upload DB". `erd_url`, if given, points
+// to a JSON object of ERD table positions applied once the data loads.
+function addLoadDataOption(label, url, erd_url) {
   const urls = Array.isArray(url) ? url : [url];
 
   el.loadDataSection.hidden = false;
@@ -2130,7 +2173,7 @@ function addLoadDataOption(label, url) {
   btn.textContent = label;
   btn.addEventListener("click", () => {
     setMenuOpen(false);
-    loadDataFromUrls(label, urls);
+    loadDataFromUrls(label, urls, erd_url);
   });
   el.loadDataSubmenu.appendChild(btn);
   return btn;
@@ -2407,6 +2450,7 @@ function initEventListeners() {
   el.erdRefresh.addEventListener("click", () => {
     if (resultsViewMode === "erd") renderErd().catch(console.error);
   });
+  el.erdLogPositions.addEventListener("click", () => logErdTablePositions());
 
   el.toggleSidebar.addEventListener("click", () => {
     const collapsed = el.sidebar.classList.toggle("collapsed");

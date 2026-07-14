@@ -26,6 +26,69 @@ create table episode (
   primary key (episode_id)
 );
 
+create table person (
+  name text,
+  birthdate date,
+  birth_name text,
+  birth_place text,
+  birth_region text,
+  birth_country text,
+  height_meters double precision,
+  nickname text,
+  primary key (name)
+);
+
+create table award (
+  award_id integer,
+  organization text,
+  year integer,
+  award_category text,
+  award text,
+  episode_id text,
+  role text,
+  person text,
+  season text,
+  song text,
+  result text,
+  primary key (award_id),
+  foreign key (episode_id) references episode(episode_id),
+  foreign key (person) references person(name)
+);
+
+create table character_award (
+  award_id integer,
+  character text,
+  primary key (award_id, character),
+  foreign key (award_id) references award(award_id)
+);
+
+create table credit (
+  episode_id text,
+  category text,
+  person text,
+  role text,
+  credited boolean,
+  primary key (episode_id, category, person, role),
+  foreign key (episode_id) references episode(episode_id),
+  foreign key (person) references person(name)
+);
+
+create table keyword (
+  episode_id text,
+  keyword text,
+  primary key (episode_id, keyword),
+  foreign key (episode_id) references episode(episode_id)
+);
+
+create table vote (
+  episode_id text,
+  stars integer,
+  votes integer,
+  percent double precision,
+  primary key (episode_id, stars),
+  foreign key (episode_id) references episode(episode_id)
+);
+
 insert into episode (episode_id, season, episode, number_in_series, title, summary, air_date, episode_image, rating, votes) values
 ('S20-E1', 20, 1, 421, 'Sex, Pies and Idiot Scrapes', 'Homer and Ned go into business together as bounty hunters, and Marge takes a job at an erotic bakery.', '2008-09-28', 'https://m.media-amazon.com/images/M/MV5BMTYwMzk2Njg5N15BMl5BanBnXkFtZTgwMzA2MDQ2MjE@._V1_UX224_CR0,0,224,126_AL_.jpg', 7.2, 1192),
 ('S20-E2', 20, 2, 422, 'Lost Verizon', 'Bart gets in trouble with Marge after she finds out that he has Denis Leary''s cell phone and is using it to make prank phone calls.', '2008-10-05', 'https://m.media-amazon.com/images/M/MV5BMjMyNzU4ODMzN15BMl5BanBnXkFtZTgwMTg5MTQ2MjE@._V1_UX224_CR0,0,224,126_AL_.jpg', 7.0, 1055),
@@ -49,17 +112,6 @@ insert into episode (episode_id, season, episode, number_in_series, title, summa
 ('S20-E20', 20, 20, 440, 'Four Great Women and a Manicure', 'A series of parodies based on four strong women: Queen Elizabeth, Snow White, Lady MacBeth, and Ayn Rand.', '2009-05-10', 'https://m.media-amazon.com/images/M/MV5BNzg5OTYwMTI3OF5BMl5BanBnXkFtZTgwNjU5MTQ2MjE@._V1_UX224_CR0,0,224,126_AL_.jpg', 6.3, 927),
 ('S20-E21', 20, 21, 441, 'Coming to Homerica', 'Townspeople build a wall around Springfield to keep "immigrants" from Ogdenville from relocating to their town.', '2009-05-17', 'https://m.media-amazon.com/images/M/MV5BMTc2MDMzOTI3MF5BMl5BanBnXkFtZTgwNzc5MTQ2MjE@._V1_UX224_CR0,0,224,126_AL_.jpg', 7.2, 1032);
 
-create table person (
-  name text,
-  birthdate date,
-  birth_name text,
-  birth_place text,
-  birth_region text,
-  birth_country text,
-  height_meters double precision,
-  nickname text,
-  primary key (name)
-);
 
 insert into person (name, birthdate, birth_name, birth_place, birth_region, birth_country, height_meters, nickname) values
 ('Marc Wilmore', '1963-05-04', 'Marc Edward Wilmore', NULL, 'California', 'USA', NULL, NULL),
@@ -434,22 +486,7 @@ insert into person (name, birthdate, birth_name, birth_place, birth_region, birt
 ('Reid Harrison', NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 ('William Wright', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
-create table award (
-  award_id integer,
-  organization text,
-  year integer,
-  award_category text,
-  award text,
-  person text,
-  role text,
-  episode_id text,
-  season text,
-  song text,
-  result text,
-  primary key (award_id),
-  foreign key (episode_id) references episode(episode_id),
-  foreign key (person) references person(name)
-);
+
 
 insert into award (award_id, organization, year, award_category, award, person, role, episode_id, season, song, result) values
 (325, 'Primetime Emmy Awards', 2009, 'Primetime Emmy', 'Outstanding Voice-Over Performance', 'Dan Castellaneta', NULL, 'S20-E18', NULL, NULL, 'Winner'),
@@ -528,12 +565,7 @@ insert into award (award_id, organization, year, award_category, award, person, 
 (1306, 'Writers Guild of America, USA', 2009, 'WGA Award (TV)', 'Comedy Series', 'William Wright', NULL, NULL, NULL, NULL, 'Nominee'),
 (1308, 'Writers Guild of America, USA', 2009, 'WGA Award (TV)', 'Animation', 'Tim Long', NULL, 'S20-E6', NULL, NULL, 'Nominee');
 
-create table character_award (
-  award_id integer,
-  character text,
-  primary key (award_id, character),
-  foreign key (award_id) references award(award_id)
-);
+
 
 insert into character_award (award_id, character) values
 (325, 'Homer Simpson'),
@@ -543,16 +575,6 @@ insert into character_award (award_id, character) values
 (327, 'Mr. Burns'),
 (327, 'Smithers');
 
-create table credit (
-  episode_id text,
-  category text,
-  person text,
-  role text,
-  credited boolean,
-  primary key (episode_id, category, person, role),
-  foreign key (episode_id) references episode(episode_id),
-  foreign key (person) references person(name)
-);
 
 insert into credit (episode_id, category, person, role, credited) values
 ('S20-E10', 'Casting Department', 'Bonita Pietila', 'casting', true),
@@ -5111,12 +5133,6 @@ insert into credit (episode_id, category, person, role, credited) values
 ('S20-E12', 'Cast', 'Tress MacNeille', 'Woman Neighbor', true),
 ('S20-E8', 'Cast', 'Tress MacNeille', 'Woman On Big TV Screen', true);
 
-create table keyword (
-  episode_id text,
-  keyword text,
-  primary key (episode_id, keyword),
-  foreign key (episode_id) references episode(episode_id)
-);
 
 insert into keyword (episode_id, keyword) values
 ('S20-E1', '1930s to 2020s'),
@@ -5427,14 +5443,7 @@ insert into keyword (episode_id, keyword) values
 ('S20-E21', 'funny accent'),
 ('S20-E21', 'barley');
 
-create table vote (
-  episode_id text,
-  stars integer,
-  votes integer,
-  percent double precision,
-  primary key (episode_id, stars),
-  foreign key (episode_id) references episode(episode_id)
-);
+
 
 insert into vote (episode_id, stars, votes, percent) values
 ('S20-E1', 2, 16, 1.3),

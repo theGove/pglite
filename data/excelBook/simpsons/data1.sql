@@ -1,20 +1,95 @@
--- Generated from CSV files in C:\Users\Gove\Box\Atlas\data\data.world\simpsons\data
--- Run this SQL in PGlite to recreate the tables.
+drop table if exists vote cascade;
+drop table if exists keyword cascade;
+drop table if exists credit cascade;
+drop table if exists character_award cascade;
+drop table if exists award cascade;
+drop table if exists person cascade;
+drop table if exists episode cascade;
 
-drop table if exists award;
+create table episode (
+  episode_id text,
+  season integer,
+  episode integer,
+  number_in_series integer,
+  title text,
+  summary text,
+  air_date date,
+  episode_image text,
+  rating double precision,
+  votes integer,
+  primary key (episode_id)
+);
+
+create table person (
+  name text,
+  birthdate date,
+  birth_name text,
+  birth_place text,
+  birth_region text,
+  birth_country text,
+  height_meters double precision,
+  nickname text,
+  primary key (name)
+);
+
 create table award (
   award_id integer,
   organization text,
   year integer,
   award_category text,
   award text,
+  episode_id text,
+  role text,
+  person text,
+  season text,
+  song text,
+  result text,
+  primary key (award_id),
+  foreign key (episode_id) references episode(episode_id),
+  foreign key (person) references person(name)
+);
+
+create table character_award (
+  award_id integer,
+  character text,
+  primary key (award_id, character),
+  foreign key (award_id) references award(award_id)
+);
+
+create table credit (
+  episode_id text,
+  category text,
   person text,
   role text,
-  episode_id text,
-  season integer,
-  song text,
-  result text
+  credited boolean,
+  primary key (episode_id, category, person, role),
+  foreign key (episode_id) references episode(episode_id),
+  foreign key (person) references person(name)
 );
+
+create table keyword (
+  episode_id text,
+  keyword text,
+  primary key (episode_id, keyword),
+  foreign key (episode_id) references episode(episode_id)
+);
+
+create table vote (
+  episode_id text,
+  stars integer,
+  votes integer,
+  percent double precision,
+  primary key (episode_id, stars),
+  foreign key (episode_id) references episode(episode_id)
+);
+
+
+
+
+BEGIN;
+
+-- Switch session to replica mode to ignore constraints
+SET session_replication_role = 'replica';
 
 insert into award (award_id, organization, year, award_category, award, person, role, episode_id, season, song, result) values
 (100, 'Golden Globes, USA', 2003, 'Golden Globe', 'Best Television Series - Comedy or Musical', NULL, NULL, NULL, NULL, NULL, 'Nominee'),
@@ -1262,11 +1337,6 @@ insert into award (award_id, organization, year, award_category, award, person, 
 (1342, 'Genesis Awards', 2007, 'Sid Caesar Comedy Award', 'Sid Caesar Comedy Award', NULL, NULL, 'S17-E16', NULL, NULL, 'Winner'),
 (1343, 'Peabody Awards', 1997, 'Peabody Award', NULL, NULL, NULL, NULL, NULL, NULL, 'Winner');
 
-drop table if exists character_award;
-create table character_award (
-  award_id integer,
-  character text
-);
 
 insert into character_award (award_id, character) values
 (122, 'Moe'),
@@ -1409,19 +1479,6 @@ insert into character_award (award_id, character) values
 (1171, 'Groundskeeper Willie');
 
 
-drop table if exists episode;
-create table episode (
-  episode_id text,
-  season integer,
-  episode integer,
-  number_in_series integer,
-  title text,
-  summary text,
-  air_date date,
-  episode_image text,
-  rating double precision,
-  votes integer
-);
 
 insert into episode (episode_id, season, episode, number_in_series, title, summary, air_date, episode_image, rating, votes) values
 ('S1-E1', 1, 1, 1, 'Simpsons Roasting on an Open Fire', 'The family is forced to spend all of their savings to get Bart''s new tattoo removed, and with no money for Christmas, Homer is forced to become a store Santa.', '1989-12-17', 'https://m.media-amazon.com/images/M/MV5BZjJjMzMwOTctODk5ZC00NWM4LTgyNjAtNjNmN2I1OTc5OTAyXkEyXkFqcGdeQXVyNTAyODkwOQ@@._V1_UY126_UX224_AL_.jpg', 8.1, 5499),
@@ -2108,11 +2165,6 @@ insert into episode (episode_id, season, episode, number_in_series, title, summa
 ('S24-E2', 24, 2, 510, 'Treehouse of Horror XXIII', 'A black hole threatens to swallow Springfield, Homer tries to find the source of paranormal activity, and a "Back to the Future" parody in which Bart keeps Marge from marrying Homer.', '2012-10-07', 'https://m.media-amazon.com/images/M/MV5BMjMxMzI4ODQ2Nl5BMl5BanBnXkFtZTgwNjg1MjQ2MjE@._V1_UX224_CR0,0,224,126_AL_.jpg', 7.2, 972),
 ('S24-E3', 24, 3, 511, 'Adventures in Baby-Getting', 'Marge decides that she wants another baby, but Homer doesn''t want one. Meanwhile, Bart tries to figure out where Lisa is secretly going after school.', '2012-11-04', 'https://m.media-amazon.com/images/M/MV5BMTY4NTQzMjMxM15BMl5BanBnXkFtZTgwNDU2MjQ2MjE@._V1_UX224_CR0,0,224,126_AL_.jpg', 6.8, 745);
 
-drop table if exists keyword;
-create table keyword (
-  episode_id text,
-  keyword text
-);
 
 insert into keyword (episode_id, keyword) values
 ('S7-E6', '3d animation'),
@@ -8938,17 +8990,7 @@ insert into keyword (episode_id, keyword) values
 ('S31-E4', 'honeymoon'),
 ('S31-E4', 'alien');
 
-drop table if exists person;
-create table person (
-  name text,
-  birthdate date,
-  birth_name text,
-  birth_place text,
-  birth_region text,
-  birth_country text,
-  height_meters double precision,
-  nickname text
-);
+
 
 insert into person (name, birthdate, birth_name, birth_place, birth_region, birth_country, height_meters, nickname) values
 ('Michael Cera', '1988-06-07', 'Michael Austin Cera', 'Brampton', 'Ontario', 'Canada', 1.75, 'Mike'),
@@ -11581,13 +11623,6 @@ insert into person (name, birthdate, birth_name, birth_place, birth_region, birt
 ('Andrew Synowiec', NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 ('Colin Campbell', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
-drop table if exists vote;
-create table vote (
-  episode_id text,
-  stars integer,
-  votes integer,
-  percent double precision
-);
 
 insert into vote (episode_id, stars, votes, percent) values
 ('S10-E1', 2, 13, 0.8),
@@ -18410,15 +18445,3 @@ insert into vote (episode_id, stars, votes, percent) values
 ('S7-E16', 2, 7, 0.4),
 ('S7-E16', 3, 10, 0.6),
 ('S7-E16', 4, 26, 1.5);
-
-
-
-drop table if exists credit;
-create table credit (
-  episode_id text,
-  category text,
-  person text,
-  role text,
-  credited boolean
-);
-
