@@ -5,6 +5,8 @@ const PGLITE_VERSION = "0.5.4";
 const PGLITE_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/index.js`;
 const PGLITE_WORKER_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/worker/index.js`;
 const THEME_KEY = "pglite-theme";
+const QUERY_HISTORY_KEY = "websql-query-history";
+const QUERY_HISTORY_MAX = 50;
 const DB_ID = "websql-studio";
 const DATA_DIR = `idb://${DB_ID}`;
 /** Enable multi-tab shared DB with ?shared=1 */
@@ -29,7 +31,7 @@ let currentResultSets = [];
 let columnsCache = new Map();
 let dataLoadingDepth = 0;
 let unsubLeaderChange = null;
-/** @type {'results' | 'erd'} */
+/** @type {'results' | 'erd' | 'history'} */
 let resultsViewMode = "results";
 let erdZoom = 1;
 /** @type {Map<string, { x: number, y: number }>} User-dragged ERD positions only. */
@@ -76,6 +78,7 @@ const el = {
   resultsBody: document.getElementById("results-body"),
   resultsMeta: document.getElementById("results-meta"),
   viewResults: document.getElementById("btn-view-results"),
+  viewHistory: document.getElementById("btn-view-history"),
   viewErd: document.getElementById("btn-view-erd"),
   erdToolbar: document.getElementById("erd-toolbar"),
   erdZoomIn: document.getElementById("btn-erd-zoom-in"),
@@ -544,11 +547,13 @@ async function runQuery() {
       ? await runMetaCommand(sql)
       : await pg.exec(sql);
     const elapsed = Math.round(performance.now() - startedAt);
+    addQueryHistoryEntry({ sql, ok: true, elapsedMs: elapsed });
     renderResults(results, elapsed);
     setStatus("Ready");
     refreshTables();
   } catch (err) {
     console.error(err);
+    addQueryHistoryEntry({ sql, ok: false, error: err.message || String(err) });
     renderError(err);
     setStatus("Query failed");
   } finally {
@@ -791,16 +796,19 @@ const ERD_CROWSFOOT_SPREAD = 7;
 const ERD_MARKER_CIRCLE_R = 3.5;
 
 /**
- * Switches the bottom pane between query results and the ERD view.
- * @param {'results' | 'erd'} mode
+ * Switches the bottom pane between query results, history, and the ERD view.
+ * @param {'results' | 'erd' | 'history'} mode
  */
 function setResultsView(mode) {
   resultsViewMode = mode;
   const showingErd = mode === "erd";
+  const showingHistory = mode === "history";
 
-  el.viewResults.classList.toggle("is-active", !showingErd);
+  el.viewResults.classList.toggle("is-active", mode === "results");
+  el.viewHistory.classList.toggle("is-active", showingHistory);
   el.viewErd.classList.toggle("is-active", showingErd);
-  el.viewResults.setAttribute("aria-selected", String(!showingErd));
+  el.viewResults.setAttribute("aria-selected", String(mode === "results"));
+  el.viewHistory.setAttribute("aria-selected", String(showingHistory));
   el.viewErd.setAttribute("aria-selected", String(showingErd));
   el.erdToolbar.hidden = !showingErd;
 
@@ -814,9 +822,147 @@ function setResultsView(mode) {
     return;
   }
 
+  if (showingHistory) {
+    renderQueryHistory();
+    return;
+  }
+
   el.resultsBody.className = lastResultsClassName;
   el.resultsBody.innerHTML = lastResultsHtml;
   el.resultsMeta.textContent = lastResultsMeta;
+}
+
+/**
+ * Reads the session query history from sessionStorage.
+ */
+function loadQueryHistory() {
+  try {
+    const raw = sessionStorage.getItem(QUERY_HISTORY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persists the session query history to sessionStorage.
+ * @param {Array<{ id: string, sql: string, at: number, ok: boolean, elapsedMs?: number, error?: string }>} entries
+ */
+function saveQueryHistory(entries) {
+  try {
+    sessionStorage.setItem(QUERY_HISTORY_KEY, JSON.stringify(entries));
+  } catch (err) {
+    console.warn("Could not save query history:", err);
+  }
+}
+
+/**
+ * Appends a query to the session history log (newest first).
+ * @param {{ sql: string, ok: boolean, elapsedMs?: number, error?: string }} entry
+ */
+function addQueryHistoryEntry(entry) {
+  const history = loadQueryHistory();
+  history.unshift({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    sql: entry.sql,
+    at: Date.now(),
+    ok: entry.ok,
+    elapsedMs: entry.elapsedMs,
+    error: entry.error,
+  });
+  saveQueryHistory(history.slice(0, QUERY_HISTORY_MAX));
+  if (resultsViewMode === "history") renderQueryHistory();
+}
+
+/**
+ * Formats a history timestamp for display.
+ * @param {number} at - Epoch milliseconds.
+ */
+function formatHistoryTime(at) {
+  try {
+    return new Date(at).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Builds a one-line preview of a SQL string for the history list.
+ * @param {string} sql
+ */
+function historySqlPreview(sql) {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Renders the session query history list in the results pane.
+ */
+function renderQueryHistory() {
+  const history = loadQueryHistory();
+  el.resultsMeta.textContent = history.length
+    ? `${history.length} quer${history.length === 1 ? "y" : "ies"} this session`
+    : "";
+
+  if (history.length === 0) {
+    el.resultsBody.className = "results-body";
+    el.resultsBody.innerHTML = `<div class="empty-hint">No queries yet this session. Run a query to start a history log.</div>`;
+    return;
+  }
+
+  const items = history
+    .map((entry) => {
+      const statusClass = entry.ok ? "is-ok" : "is-error";
+      const statusLabel = entry.ok ? "OK" : "Error";
+      const metaParts = [formatHistoryTime(entry.at)];
+      if (entry.ok && typeof entry.elapsedMs === "number") metaParts.push(`${entry.elapsedMs} ms`);
+      if (!entry.ok && entry.error) metaParts.push(entry.error);
+      return `<li class="history-item ${statusClass}" data-history-id="${escapeHtml(entry.id)}">
+        <div class="history-item-top">
+          <span class="history-status">${statusLabel}</span>
+          <span class="history-meta">${escapeHtml(metaParts.join(" · "))}</span>
+          <button type="button" class="history-load-btn" data-history-id="${escapeHtml(entry.id)}" title="Load and run this query">Run</button>
+        </div>
+        <pre class="history-sql">${escapeHtml(historySqlPreview(entry.sql))}</pre>
+      </li>`;
+    })
+    .join("");
+
+  el.resultsBody.className = "results-body history-body";
+  el.resultsBody.innerHTML = `<div class="history-panel">
+    <div class="history-toolbar">
+      <button type="button" class="btn history-clear-btn" id="btn-clear-history">Clear history</button>
+    </div>
+    <ul class="history-list">${items}</ul>
+  </div>`;
+}
+
+/**
+ * Loads a history entry's SQL into the editor and runs it.
+ * @param {string} id - History entry id.
+ */
+function loadHistoryQuery(id) {
+  const entry = loadQueryHistory().find((item) => item.id === id);
+  if (!entry || !editor) return;
+  editor.setValue(entry.sql);
+  editor.focus();
+  runQuery();
+}
+
+/**
+ * Clears the session query history log.
+ */
+function clearQueryHistory() {
+  saveQueryHistory([]);
+  if (resultsViewMode === "history") renderQueryHistory();
+  showToast("Query history cleared");
 }
 
 /**
@@ -2366,9 +2512,22 @@ function initEventListeners() {
   el.run.addEventListener("click", () => runQuery());
 
   el.resultsBody.addEventListener("click", (e) => {
-    const btn = e.target.closest(".csv-btn");
-    if (!btn) return;
-    downloadResultAsCsv(Number(btn.getAttribute("data-idx")));
+    const csvBtn = e.target.closest(".csv-btn");
+    if (csvBtn) {
+      downloadResultAsCsv(Number(csvBtn.getAttribute("data-idx")));
+      return;
+    }
+
+    const clearHistoryBtn = e.target.closest(".history-clear-btn");
+    if (clearHistoryBtn) {
+      if (confirm("Clear all queries from this session's history?")) clearQueryHistory();
+      return;
+    }
+
+    const loadBtn = e.target.closest(".history-load-btn");
+    const historyItem = e.target.closest(".history-item");
+    const historyId = (loadBtn || historyItem)?.getAttribute("data-history-id");
+    if (historyId) loadHistoryQuery(historyId);
   });
 
   el.menuButton.addEventListener("click", () => {
@@ -2444,6 +2603,7 @@ function initEventListeners() {
   el.refreshTables.addEventListener("click", () => refreshTables());
 
   el.viewResults.addEventListener("click", () => setResultsView("results"));
+  el.viewHistory.addEventListener("click", () => setResultsView("history"));
   el.viewErd.addEventListener("click", () => setResultsView("erd"));
   el.erdZoomIn.addEventListener("click", () => changeErdZoom(ERD_ZOOM_STEP));
   el.erdZoomOut.addEventListener("click", () => changeErdZoom(-ERD_ZOOM_STEP));
