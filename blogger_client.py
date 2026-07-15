@@ -32,27 +32,49 @@ class _NoRedirect(urllib.request.HTTPErrorProcessor):
     https_response = http_response
 
 
-def publish(post_id, content, blog_id=BLOG_ID):
-    """Publish `content` (a string) to the given Blogger post ID. Returns the parsed post JSON."""
+def publish(post_id, content, blog_id=BLOG_ID, retries=2):
+    """Publish `content` to the given Blogger post ID; retries on empty/non-JSON echo responses.
+
+    @param {str} post_id - Blogger post ID to update.
+    @param {str} content - Post body HTML/text to write.
+    @param {str} [blog_id] - Blogger blog ID (defaults to BLOG_ID).
+    @param {int} [retries] - Extra attempts after an empty/non-JSON echo response.
+    """
     endpoint = load_endpoint()
     payload = json.dumps(
         {"mode": "publish", "content": content, "blogId": blog_id, "postId": post_id}
     ).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST"
-    )
-    opener = urllib.request.build_opener(_NoRedirect)
-    resp = opener.open(req)
-    if resp.status != 302:
-        raise RuntimeError(
-            f"Expected a 302 redirect, got {resp.status}: {resp.read().decode('utf-8', 'replace')[:500]}"
+    last_error = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST"
         )
-    location = resp.headers.get("Location")
-    if not location:
-        raise RuntimeError("No Location header on the redirect response")
-    with urllib.request.urlopen(location) as final:
-        body = final.read().decode("utf-8")
-    return json.loads(body)
+        opener = urllib.request.build_opener(_NoRedirect)
+        resp = opener.open(req)
+        if resp.status != 302:
+            raise RuntimeError(
+                f"Expected a 302 redirect, got {resp.status}: {resp.read().decode('utf-8', 'replace')[:500]}"
+            )
+        location = resp.headers.get("Location")
+        if not location:
+            raise RuntimeError("No Location header on the redirect response")
+        with urllib.request.urlopen(location) as final:
+            body = final.read().decode("utf-8")
+        if not body.strip():
+            last_error = RuntimeError(
+                f"Empty response from Apps Script echo URL (attempt {attempt + 1}/{retries + 1})"
+            )
+            continue
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as e:
+            last_error = RuntimeError(
+                f"Non-JSON response from Apps Script (attempt {attempt + 1}/{retries + 1}): "
+                f"{body[:300]!r}"
+            )
+            last_error.__cause__ = e
+            continue
+    raise last_error
 
 
 def fetch_post_body_by_path(path, blog_origin=BLOG_ORIGIN):

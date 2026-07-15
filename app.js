@@ -98,7 +98,7 @@ const el = {
   dbLoadingOverlay: document.getElementById("db-loading-overlay"),
   dbLoadingTitle: document.getElementById("db-loading-title"),
   dbLoadingSubtitle: document.getElementById("db-loading-subtitle"),
-  brandName: document.getElementById("brand-name"),
+  brandName: document.getElementById("brand-name") || document.querySelector(".brand-name"),
 };
 
 applyTheme(getPreferredTheme());
@@ -115,11 +115,15 @@ function stripFileExtension(name) {
   return name.replace(/\.(tar\.gz|tgz|[a-z0-9]+)$/i, "");
 }
 
+/**
+ * Updates the status-bar and header labels that show the current database name.
+ * @param {string} label - Filename or display name for the loaded database.
+ */
 function setDbLabel(label) {
   currentFileLabel = label;
   const displayLabel = stripFileExtension(label);
-  el.dbName.textContent = displayLabel;
-  el.brandName.textContent = displayLabel;
+  if (el.dbName) el.dbName.textContent = displayLabel;
+  if (el.brandName) el.brandName.textContent = displayLabel;
 }
 
 function setMenuOpen(isOpen) {
