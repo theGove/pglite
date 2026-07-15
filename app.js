@@ -191,8 +191,18 @@ function showToast(message, kind) {
   }, 3200);
 }
 
+/**
+ * Enables or disables primary actions and shows a spinner on the Run button.
+ * @param {boolean} isBusy - Whether the UI should appear busy.
+ */
 function setBusy(isBusy) {
   el.run.disabled = isBusy;
+  el.run.classList.toggle("is-busy", isBusy);
+  el.run.setAttribute("aria-busy", isBusy ? "true" : "false");
+  const runIcon = el.run.querySelector(".run-icon");
+  const runSpinner = el.run.querySelector(".spinner");
+  if (runIcon) runIcon.hidden = isBusy;
+  if (runSpinner) runSpinner.hidden = !isBusy;
   el.menuButton.disabled = isBusy;
 }
 
