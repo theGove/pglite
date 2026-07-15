@@ -219,6 +219,7 @@ function initMonaco() {
         wordWrap: "on",
       });
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runQuery());
+      watchSqlUrlSync();
       resolve();
     });
   });
@@ -234,6 +235,37 @@ function applySqlUrlParameter() {
   if (value !== null) {
     editor.setValue(value);
   }
+}
+
+/**
+ * Writes the current editor SQL into the `sql` query param (admin mode only).
+ * Uses replaceState so typing does not flood browser history.
+ */
+function syncSqlToUrl() {
+  if (!isAdminMode || !editor) return;
+
+  const sql = editor.getValue();
+  const url = new URL(window.location.href);
+  if (sql) {
+    url.searchParams.set("sql", sql);
+  } else {
+    url.searchParams.delete("sql");
+  }
+  history.replaceState(null, "", url);
+}
+
+/**
+ * Keeps the `sql` query param in sync with the editor while in admin mode.
+ */
+function watchSqlUrlSync() {
+  if (!isAdminMode || !editor) return;
+
+  let timer = null;
+  editor.onDidChangeModelContent(() => {
+    clearTimeout(timer);
+    timer = setTimeout(syncSqlToUrl, 300);
+  });
+  syncSqlToUrl();
 }
 
 // ---- PGlite setup ------------------------------------------------------------
