@@ -24,6 +24,10 @@
   --erd-muted: #748094;
   --erd-key: #1f6f78;
   --erd-line: #687487;
+  --scrollbar-size: 8px;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #c8ced8;
+  --scrollbar-thumb-hover: #aeb6c4;
 }
 
 :root[data-theme="dark"] {
@@ -49,10 +53,45 @@
   --erd-muted: #8b95a8;
   --erd-key: #6ec4cf;
   --erd-line: #8b95a8;
+  --scrollbar-thumb: #4a4f5a;
+  --scrollbar-thumb-hover: #5e6472;
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* Minimal scrollbars — Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+/* Minimal scrollbars — WebKit (Chrome, Safari, Edge) */
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html, body {
