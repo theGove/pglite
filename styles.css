@@ -490,8 +490,23 @@ body {
   font-weight: 600;
 }
 
-.results-header-run {
+.results-header-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-btn-open-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  line-height: 0;
+}
+
+.icon-btn-open-tab[hidden] {
+  display: none;
 }
 
 .results-meta {

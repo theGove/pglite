@@ -12,6 +12,8 @@ const SHARED_DB_PARAM = "shared";
 const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
 /** Lock the session read-only after data load when ?readonly=1 */
 const useReadOnly = new URLSearchParams(window.location.search).get("readonly") === "1";
+/** Compact embed chrome when ?style=minimal */
+const isMinimalStyle = new URLSearchParams(window.location.search).get("style") === "minimal";
 /**
  * Builds a stable IndexedDB / worker id from the page pathname so shared
  * mode only syncs tabs/iframes that share the same location.pathname.
@@ -74,6 +76,7 @@ let lastResultsClassName = "results-body";
 
 const el = {
   run: document.getElementById("btn-run"),
+  openNewTab: document.getElementById("btn-open-new-tab"),
   menu: document.getElementById("menu"),
   menuButton: document.getElementById("btn-menu"),
   menuPanel: document.getElementById("menu-panel"),
@@ -82,6 +85,7 @@ const el = {
   //menuImportGist: document.getElementById("menu-import-gist"),
   //menuSaveGist: document.getElementById("menu-save-gist"),
   menuExportExcel: document.getElementById("menu-export-excel"),
+  menuOpenNewTab: document.getElementById("menu-open-new-tab"),
   menuTheme: document.getElementById("menu-theme"),
   themeIcon: document.getElementById("theme-icon"),
   themeLabel: document.getElementById("theme-label"),
@@ -122,6 +126,7 @@ const el = {
 applyTheme(getPreferredTheme());
 setStatusBarVisible(false);
 el.erdLogPositions.hidden = !isAdminMode;
+if (el.openNewTab) el.openNewTab.hidden = !isMinimalStyle;
 
 // ---- Small UI helpers -----------------------------------------------------
 
@@ -266,6 +271,32 @@ function applySqlUrlParameter() {
     editor.setValue(value);
     runQuery();
   }
+}
+
+/**
+ * Builds a shareable URL for the current page setup: same path, with `sql`
+ * set to the editor contents. Omits shared/readonly/style so the new tab is
+ * a normal private studio session (not an embed or shared DB).
+ */
+function buildCurrentSetupUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("style");
+  url.searchParams.delete(SHARED_DB_PARAM);
+  url.searchParams.delete("readonly");
+  if (editor) {
+    const sql = editor.getValue();
+    if (sql) url.searchParams.set("sql", sql);
+    else url.searchParams.delete("sql");
+  }
+  return url.toString();
+}
+
+/**
+ * Opens a new browser tab with a URL reflecting the current studio setup.
+ */
+function handleOpenInNewTab() {
+  const url = buildCurrentSetupUrl();
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 // ---- PGlite setup ------------------------------------------------------------
@@ -2745,6 +2776,15 @@ function initEventListeners() {
     setMenuOpen(false);
     handleExportExcel();
   });
+
+  el.menuOpenNewTab.addEventListener("click", () => {
+    setMenuOpen(false);
+    handleOpenInNewTab();
+  });
+
+  if (el.openNewTab) {
+    el.openNewTab.addEventListener("click", () => handleOpenInNewTab());
+  }
 
   el.menuTheme.addEventListener("click", () => {
     setMenuOpen(false);
