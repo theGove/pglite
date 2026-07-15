@@ -10,6 +10,8 @@ const QUERY_HISTORY_MAX = 50;
 /** Enable multi-tab shared DB with ?shared=1 */
 const SHARED_DB_PARAM = "shared";
 const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
+/** Lock the session read-only after data load when ?readonly=1 */
+const useReadOnly = new URLSearchParams(window.location.search).get("readonly") === "1";
 /**
  * Builds a stable IndexedDB / worker id from the page pathname so shared
  * mode only syncs tabs/iframes that share the same location.pathname.
@@ -418,6 +420,15 @@ async function switchDatabase(factory, label, { showLoadingOverlay = true } = {}
     setBusy(false);
     if (showLoadingOverlay) setDataLoading(false);
   }
+}
+
+/**
+ * Locks the current session so subsequent transactions are read-only.
+ * No-op unless ?readonly=1 is set. Call only after data has been loaded.
+ */
+async function maybeSetDatabaseReadOnly() {
+  if (!useReadOnly || !pg) return;
+  await pg.query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;");
 }
 
 async function importIntoCurrentDatabase(file) {
@@ -2328,6 +2339,7 @@ async function importGistCsvs(gistId) {
 
     await refreshTables();
     clearResults("Run a query to see results here.");
+    await maybeSetDatabaseReadOnly();
     showToast(`Imported ${csvFiles.length} CSV file${csvFiles.length === 1 ? "" : "s"} from gist ${id}`, "success");
   } finally {
     setDataLoading(false);
@@ -2342,8 +2354,9 @@ async function handleUpload(file) {
     if (kind === "tarball") {
       await wipeCurrentDatabaseStore();
       await switchDatabase(() => createDatabase({ loadDataDir: file }), file.name);
+      await maybeSetDatabaseReadOnly();
       showToast(`Loaded "${file.name}"`, "success");
-      return;
+      return true;
     }
 
     if (kind === "sql" || kind === "csv" || kind === "excel") {
@@ -2351,11 +2364,17 @@ async function handleUpload(file) {
       setDbLabel(currentFileLabel === DEFAULT_DB_LABEL ? file.name : currentFileLabel);
       await refreshTables();
       clearResults("Run a query to see results here.");
+      await maybeSetDatabaseReadOnly();
       showToast(`Imported "${file.name}"`, "success");
-      return;
+      return true;
     }
 
     showToast("Unsupported file type. Use .tar, .tar.gz, .sql, .csv or Excel", "error");
+    return false;
+  } catch (err) {
+    console.error(err);
+    showToast(`Could not import "${file.name}": ${err.message}`, "error");
+    return false;
   } finally {
     setDataLoading(false);
   }
@@ -2411,7 +2430,10 @@ async function isDatabaseEmpty() {
 async function loadDataFromUrls(label, urls) {
   // In shared mode another tab may have already loaded this data - avoid
   // wiping and reloading it out from under them.
-  if (useSharedDb && !(await isDatabaseEmpty())) return;
+  if (useSharedDb && !(await isDatabaseEmpty())) {
+    await maybeSetDatabaseReadOnly();
+    return;
+  }
 
   setBusy(true);
   setDataLoading(true, `Fetching "${label}"…`);
@@ -2438,8 +2460,8 @@ async function loadDataFromUrls(label, urls) {
     }
     await wipeCurrentDatabaseStore();
     await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
-    await handleUpload(file);
-    runQuery()
+    const uploaded = await handleUpload(file);
+    if (uploaded) runQuery();
   } catch (err) {
     console.error(err);
     setStatus("Ready");
