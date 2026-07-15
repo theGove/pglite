@@ -292,7 +292,7 @@ AND event_date < '2020-03-01'
 ```sql
 SELECT event_name, event_date
 FROM event
-WHERE YEAR(event_date) = 2019
+WHERE EXTRACT(YEAR FROM event_date) = 2019
 ```
 
 #### Figure 13.26 — Events that Occurred in November
@@ -300,7 +300,7 @@ WHERE YEAR(event_date) = 2019
 ```sql
 SELECT event_name, event_date
 FROM event
-WHERE MONTH(event_date) = 11
+WHERE EXTRACT(MONTH FROM event_date) = 11
 ```
 
 #### Figure 13.27 — Events that Occurred on the 12th
@@ -308,7 +308,7 @@ WHERE MONTH(event_date) = 11
 ```sql
 SELECT event_name, event_date
 FROM event
-WHERE DAY(event_date) = 12
+WHERE EXTRACT(DAY FROM event_date) = 12
 ```
 
 #### Figure 13.28 — Events that Occurred on 3/10/2020
@@ -316,9 +316,9 @@ WHERE DAY(event_date) = 12
 ```sql
 SELECT event_name, event_date
 FROM event
-WHERE MONTH(event_date) = 3
-AND DAY(event_date) = 10
-AND YEAR(event_date) = 2020
+WHERE EXTRACT(MONTH FROM event_date) = 3
+AND EXTRACT(DAY FROM event_date) = 10
+AND EXTRACT(YEAR FROM event_date) = 2020
 ```
 
 #### Figure 13.29 — Events that Occurred During February of 2020
@@ -326,8 +326,8 @@ AND YEAR(event_date) = 2020
 ```sql
 SELECT event_name, event_date
 FROM event
-WHERE MONTH(event_date) = 2
-AND YEAR(event_date) = 2020
+WHERE EXTRACT(MONTH FROM event_date) = 2
+AND EXTRACT(YEAR FROM event_date) = 2020
 ```
 
 ### 13.9 Wildcards
