@@ -10,6 +10,10 @@ const QUERY_HISTORY_MAX = 50;
 /** Enable multi-tab shared DB with ?shared=1 */
 const SHARED_DB_PARAM = "shared";
 const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
+/** Lock the session read-only after data load when ?readonly=1 */
+const useReadOnly = new URLSearchParams(window.location.search).get("readonly") === "1";
+/** Compact embed chrome when ?style=minimal */
+const isMinimalStyle = new URLSearchParams(window.location.search).get("style") === "minimal";
 /**
  * Builds a stable IndexedDB / worker id from the page pathname so shared
  * mode only syncs tabs/iframes that share the same location.pathname.
@@ -72,6 +76,7 @@ let lastResultsClassName = "results-body";
 
 const el = {
   run: document.getElementById("btn-run"),
+  openNewTab: document.getElementById("btn-open-new-tab"),
   menu: document.getElementById("menu"),
   menuButton: document.getElementById("btn-menu"),
   menuPanel: document.getElementById("menu-panel"),
@@ -80,6 +85,7 @@ const el = {
   //menuImportGist: document.getElementById("menu-import-gist"),
   //menuSaveGist: document.getElementById("menu-save-gist"),
   menuExportExcel: document.getElementById("menu-export-excel"),
+  menuOpenNewTab: document.getElementById("menu-open-new-tab"),
   menuTheme: document.getElementById("menu-theme"),
   themeIcon: document.getElementById("theme-icon"),
   themeLabel: document.getElementById("theme-label"),
@@ -120,6 +126,7 @@ const el = {
 applyTheme(getPreferredTheme());
 setStatusBarVisible(false);
 el.erdLogPositions.hidden = !isAdminMode;
+if (el.openNewTab) el.openNewTab.hidden = !isMinimalStyle;
 
 // ---- Small UI helpers -----------------------------------------------------
 
@@ -184,8 +191,18 @@ function showToast(message, kind) {
   }, 3200);
 }
 
+/**
+ * Enables or disables primary actions and shows a spinner on the Run button.
+ * @param {boolean} isBusy - Whether the UI should appear busy.
+ */
 function setBusy(isBusy) {
   el.run.disabled = isBusy;
+  el.run.classList.toggle("is-busy", isBusy);
+  el.run.setAttribute("aria-busy", isBusy ? "true" : "false");
+  const runIcon = el.run.querySelector(".run-icon");
+  const runSpinner = el.run.querySelector(".spinner");
+  if (runIcon) runIcon.hidden = isBusy;
+  if (runSpinner) runSpinner.hidden = !isBusy;
   el.menuButton.disabled = isBusy;
 }
 
@@ -264,6 +281,32 @@ function applySqlUrlParameter() {
     editor.setValue(value);
     runQuery();
   }
+}
+
+/**
+ * Builds a shareable URL for the current page setup: same path, with `sql`
+ * set to the editor contents. Omits shared/readonly/style so the new tab is
+ * a normal private studio session (not an embed or shared DB).
+ */
+function buildCurrentSetupUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("style");
+  url.searchParams.delete(SHARED_DB_PARAM);
+  url.searchParams.delete("readonly");
+  if (editor) {
+    const sql = editor.getValue();
+    if (sql) url.searchParams.set("sql", sql);
+    else url.searchParams.delete("sql");
+  }
+  return url.toString();
+}
+
+/**
+ * Opens a new browser tab with a URL reflecting the current studio setup.
+ */
+function handleOpenInNewTab() {
+  const url = buildCurrentSetupUrl();
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 // ---- PGlite setup ------------------------------------------------------------
@@ -418,6 +461,15 @@ async function switchDatabase(factory, label, { showLoadingOverlay = true } = {}
     setBusy(false);
     if (showLoadingOverlay) setDataLoading(false);
   }
+}
+
+/**
+ * Locks the current session so subsequent transactions are read-only.
+ * No-op unless ?readonly=1 is set. Call only after data has been loaded.
+ */
+async function maybeSetDatabaseReadOnly() {
+  if (!useReadOnly || !pg) return;
+  await pg.query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;");
 }
 
 async function importIntoCurrentDatabase(file) {
@@ -2328,6 +2380,7 @@ async function importGistCsvs(gistId) {
 
     await refreshTables();
     clearResults("Run a query to see results here.");
+    await maybeSetDatabaseReadOnly();
     showToast(`Imported ${csvFiles.length} CSV file${csvFiles.length === 1 ? "" : "s"} from gist ${id}`, "success");
   } finally {
     setDataLoading(false);
@@ -2342,8 +2395,9 @@ async function handleUpload(file) {
     if (kind === "tarball") {
       await wipeCurrentDatabaseStore();
       await switchDatabase(() => createDatabase({ loadDataDir: file }), file.name);
+      await maybeSetDatabaseReadOnly();
       showToast(`Loaded "${file.name}"`, "success");
-      return;
+      return true;
     }
 
     if (kind === "sql" || kind === "csv" || kind === "excel") {
@@ -2351,11 +2405,17 @@ async function handleUpload(file) {
       setDbLabel(currentFileLabel === DEFAULT_DB_LABEL ? file.name : currentFileLabel);
       await refreshTables();
       clearResults("Run a query to see results here.");
+      await maybeSetDatabaseReadOnly();
       showToast(`Imported "${file.name}"`, "success");
-      return;
+      return true;
     }
 
     showToast("Unsupported file type. Use .tar, .tar.gz, .sql, .csv or Excel", "error");
+    return false;
+  } catch (err) {
+    console.error(err);
+    showToast(`Could not import "${file.name}": ${err.message}`, "error");
+    return false;
   } finally {
     setDataLoading(false);
   }
@@ -2411,7 +2471,10 @@ async function isDatabaseEmpty() {
 async function loadDataFromUrls(label, urls) {
   // In shared mode another tab may have already loaded this data - avoid
   // wiping and reloading it out from under them.
-  if (useSharedDb && !(await isDatabaseEmpty())) return;
+  if (useSharedDb && !(await isDatabaseEmpty())) {
+    await maybeSetDatabaseReadOnly();
+    return;
+  }
 
   setBusy(true);
   setDataLoading(true, `Fetching "${label}"…`);
@@ -2438,8 +2501,8 @@ async function loadDataFromUrls(label, urls) {
     }
     await wipeCurrentDatabaseStore();
     await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
-    await handleUpload(file);
-    runQuery()
+    const uploaded = await handleUpload(file);
+    if (uploaded) runQuery();
   } catch (err) {
     console.error(err);
     setStatus("Ready");
@@ -2723,6 +2786,15 @@ function initEventListeners() {
     setMenuOpen(false);
     handleExportExcel();
   });
+
+  el.menuOpenNewTab.addEventListener("click", () => {
+    setMenuOpen(false);
+    handleOpenInNewTab();
+  });
+
+  if (el.openNewTab) {
+    el.openNewTab.addEventListener("click", () => handleOpenInNewTab());
+  }
 
   el.menuTheme.addEventListener("click", () => {
     setMenuOpen(false);

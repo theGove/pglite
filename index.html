@@ -38,6 +38,9 @@
           <button class="menu-item" id="menu-export-excel">
             <span class="icon">📊</span> Export All Tables to Excel
           </button>
+          <button class="menu-item" id="menu-open-new-tab">
+            <span class="icon">↗</span> Open in New Tab
+          </button>
           <div class="menu-separator"></div>
           <button class="menu-item" id="menu-theme">
             <span class="icon" id="theme-icon">🌙</span> <span id="theme-label">Dark Mode</span>
@@ -91,9 +94,18 @@
             <button id="btn-erd-refresh" class="icon-btn" title="Refresh ERD" aria-label="Refresh ERD">⟲</button>
             <button id="btn-erd-log-positions" class="icon-btn" title="Log table positions as JSON (admin)" aria-label="Log ERD table positions" hidden>{ }</button>
           </div>
-          <button id="btn-run" class="btn btn-primary results-header-run" title="Run query (Ctrl/Cmd+Enter)">
-            <span class="icon">▶</span> Run
-          </button>
+          <div class="results-header-actions">
+            <button id="btn-open-new-tab" class="icon-btn icon-btn-open-tab" title="Open in New Tab" aria-label="Open in New Tab" hidden>
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M6 3H3.5A1.5 1.5 0 0 0 2 4.5v8A1.5 1.5 0 0 0 3.5 14h8a1.5 1.5 0 0 0 1.5-1.5V10M10 2h4v4M14 2 7 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button id="btn-run" class="btn btn-primary" title="Run query (Ctrl/Cmd+Enter)">
+              <span class="icon run-icon">▶</span>
+              <span class="spinner spinner-btn" hidden aria-hidden="true"></span>
+              Run
+            </button>
+          </div>
         </div>
         <div id="results-body" class="results-body">
           <div class="empty-hint">Run a query to see results here.</div>
