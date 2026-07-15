@@ -1,7 +1,7 @@
 // ---- Config -----------------------------------------------------------
 
-const MONACO_VERSION = "0.52.2";
 const PGLITE_VERSION = "0.5.4";
+const CODEMIRROR_URL = new URL("./vendor/codemirror.js", import.meta.url).href;
 const PGLITE_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/index.js`;
 const PGLITE_WORKER_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/worker/index.js`;
 const THEME_KEY = "pglite-theme";
@@ -41,7 +41,14 @@ select now() as server_time, version() as postgres_version;`;
 
 let pg = null;
 let editor = null;
-let monacoRef = null;
+/** @type {any} */
+let editorView = null;
+/** @type {any} */
+let editorThemeCompartment = null;
+/** @type {any} */
+let oneDarkTheme = null;
+/** @type {any} */
+let lightEditorTheme = null;
 let currentFileLabel = DEFAULT_DB_LABEL;
 let currentResultSets = [];
 let columnsCache = new Map();
@@ -154,8 +161,12 @@ function setMenuOpen(isOpen) {
 
 // ---- Theme -----------------------------------------------------------------
 
-function monacoThemeFor(theme) {
-  return theme === "dark" ? "vs-dark" : "vs";
+/**
+ * Returns the CodeMirror theme extension for the given UI theme.
+ * @param {string} theme - 'light' or 'dark'
+ */
+function editorThemeExtension(theme) {
+  return theme === "dark" ? oneDarkTheme : lightEditorTheme;
 }
 
 function getPreferredTheme() {
@@ -167,7 +178,11 @@ function getPreferredTheme() {
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
   localStorage.setItem(THEME_KEY, theme);
-  if (monacoRef && editor) monacoRef.editor.setTheme(monacoThemeFor(theme));
+  if (editorView && editorThemeCompartment) {
+    editorView.dispatch({
+      effects: editorThemeCompartment.reconfigure(editorThemeExtension(theme)),
+    });
+  }
 
   const next = theme === "dark" ? "light" : "dark";
   el.themeIcon.textContent = next === "dark" ? "🌙" : "☀️";
@@ -226,31 +241,136 @@ function setDataLoading(isLoading, message = "Loading data…") {
   }
 }
 
-// ---- Monaco setup ----------------------------------------------------------
+// ---- CodeMirror setup ------------------------------------------------------
 
-function initMonaco() {
-  return new Promise((resolve) => {
-    require.config({
-      paths: { vs: `https://cdn.jsdelivr.net/npm/monaco-editor@${MONACO_VERSION}/min/vs` },
-    });
-    require(["vs/editor/editor.main"], (monaco) => {
-      monacoRef = monaco;
-      const params = new URLSearchParams(window.location.search);
-      const initialSql = params.has("sql") ? params.get("sql") : DEFAULT_SQL;
-      editor = monaco.editor.create(el.editorPane, {
-        value: initialSql || DEFAULT_SQL,
-        language: "sql",
-        theme: monacoThemeFor(document.documentElement.getAttribute("data-theme")),
-        fontSize: 13,
-        minimap: { enabled: false },
-        automaticLayout: true,
-        scrollBeyondLastLine: false,
-        wordWrap: "on",
+/**
+ * Builds a thin getValue/setValue/focus facade over a CodeMirror EditorView.
+ * @param {any} view - CodeMirror EditorView instance.
+ */
+function createEditorApi(view) {
+  return {
+    /**
+     * Returns the full editor document text.
+     */
+    getValue() {
+      return view.state.doc.toString();
+    },
+    /**
+     * Replaces the full editor document text.
+     * @param {string} value
+     */
+    setValue(value) {
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: value ?? "" },
       });
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runQuery());
-      resolve();
-    });
+    },
+    /**
+     * Focuses the editor.
+     */
+    focus() {
+      view.focus();
+    },
+    /**
+     * Asks CodeMirror to remeasure layout after the pane is resized.
+     */
+    layout() {
+      view.requestMeasure();
+    },
+    /**
+     * Returns the underlying CodeMirror view.
+     */
+    getView() {
+      return view;
+    },
+  };
+}
+
+/**
+ * Loads CodeMirror and mounts the SQL editor into #editor-pane.
+ */
+async function initCodeMirror() {
+  const {
+    EditorView,
+    EditorState,
+    basicSetup,
+    Compartment,
+    Prec,
+    keymap,
+    sql,
+    PostgreSQL,
+    oneDark,
+  } = await import(CODEMIRROR_URL);
+
+  oneDarkTheme = oneDark;
+  editorThemeCompartment = new Compartment();
+  lightEditorTheme = EditorView.theme(
+    {
+      "&": {
+        backgroundColor: "var(--panel)",
+        color: "var(--text)",
+      },
+      ".cm-content": {
+        caretColor: "var(--text)",
+      },
+      "&.cm-focused .cm-cursor": {
+        borderLeftColor: "var(--text)",
+      },
+      "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection": {
+        backgroundColor: "var(--accent-tint)",
+      },
+      ".cm-gutters": {
+        backgroundColor: "var(--panel)",
+        color: "var(--text-muted)",
+        borderRight: "1px solid var(--border)",
+      },
+      ".cm-activeLineGutter": {
+        backgroundColor: "var(--hover-bg)",
+      },
+      ".cm-activeLine": {
+        backgroundColor: "var(--hover-bg)",
+      },
+    },
+    { dark: false }
+  );
+
+  const params = new URLSearchParams(window.location.search);
+  const initialSql = params.has("sql") ? params.get("sql") : DEFAULT_SQL;
+  const theme = document.documentElement.getAttribute("data-theme") || "dark";
+
+  const runKeymap = Prec.highest(
+    keymap.of([
+      {
+        key: "Mod-Enter",
+        run: () => {
+          runQuery();
+          return true;
+        },
+      },
+      {
+        key: "Ctrl-Enter",
+        run: () => {
+          runQuery();
+          return true;
+        },
+      },
+    ])
+  );
+
+  editorView = new EditorView({
+    parent: el.editorPane,
+    state: EditorState.create({
+      doc: initialSql || DEFAULT_SQL,
+      extensions: [
+        basicSetup,
+        sql({ dialect: PostgreSQL }),
+        runKeymap,
+        EditorView.lineWrapping,
+        editorThemeCompartment.of(editorThemeExtension(theme)),
+      ],
+    }),
   });
+
+  editor = createEditorApi(editorView);
 }
 
 function applySqlUrlParameter() {
@@ -556,13 +676,15 @@ async function runMetaCommand(text) {
   throw new Error(`Unsupported meta command: ${commandToken}`);
 }
 
+/**
+ * Shrinks the editor pane when the query is shorter than the current height.
+ */
 function shrinkEditorToFitQuery() {
-  if (!editor || !monacoRef) return;
+  if (!editorView) return;
   const minHeight = 80; // matches .editor-pane min-height in styles.css
-  const lineCount = editor.getModel().getLineCount();
-  const lineHeight = editor.getOption(monacoRef.editor.EditorOption.lineHeight);
-  const padding = editor.getOption(monacoRef.editor.EditorOption.padding) || { top: 0, bottom: 0 };
-  const fitHeight = lineCount * lineHeight + padding.top + padding.bottom;
+  const lineCount = editorView.state.doc.lines;
+  const lineHeight = editorView.defaultLineHeight;
+  const fitHeight = lineCount * lineHeight + 16;
   const targetHeight = Math.max(fitHeight, minHeight);
   const currentHeight = el.editorPane.getBoundingClientRect().height;
   if (targetHeight < currentHeight) {
@@ -2643,6 +2765,7 @@ function initResizer() {
     const max = layout.height - 100;
     const clamped = Math.max(min, Math.min(max, relative));
     el.editorPane.style.flex = `0 0 ${clamped}px`;
+    if (editor) editor.layout();
   });
 
   window.addEventListener("mouseup", () => {
@@ -2770,7 +2893,7 @@ function initEventListeners() {
 async function main() {
   initEventListeners();
   initResizer();
-  await initMonaco();
+  await initCodeMirror();
   await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
   applySqlUrlParameter();
 }

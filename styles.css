@@ -406,6 +406,25 @@ body {
 .editor-pane {
   flex: 0 0 42%;
   min-height: 80px;
+  overflow: hidden;
+}
+
+.editor-pane .cm-editor {
+  height: 100%;
+  font-size: 13px;
+}
+
+.editor-pane .cm-scroller {
+  font-family: var(--mono);
+  line-height: 1.5;
+}
+
+.editor-pane .cm-editor.cm-focused {
+  outline: none;
+}
+
+.editor-pane .cm-content {
+  padding: 8px 0;
 }
 
 .resizer {
