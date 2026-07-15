@@ -7,11 +7,28 @@ const PGLITE_WORKER_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${P
 const THEME_KEY = "pglite-theme";
 const QUERY_HISTORY_KEY = "websql-query-history";
 const QUERY_HISTORY_MAX = 50;
-const DB_ID = "websql-studio";
-const DATA_DIR = `idb://${DB_ID}`;
 /** Enable multi-tab shared DB with ?shared=1 */
 const SHARED_DB_PARAM = "shared";
 const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
+/**
+ * Builds a stable IndexedDB / worker id from the page pathname so shared
+ * mode only syncs tabs/iframes that share the same location.pathname.
+ * @param {string} pathname - window.location.pathname
+ */
+function sharedDbIdForPathname(pathname) {
+  const path = (pathname || "/").replace(/\/+$/, "") || "/";
+  console.log("path", path);
+  if (path === "/") return "websql-studio";
+  const safe = path
+    .replace(/^\/+/, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return safe ? `websql-studio-${safe}` : "websql-studio";
+}
+const DB_ID = sharedDbIdForPathname(window.location.pathname);
+console.log("DB_ID", DB_ID);
+const DATA_DIR = `idb://${DB_ID}`;
 /** Enables admin-only ERD tooling with ?mode=admin */
 const isAdminMode = new URLSearchParams(window.location.search).get("mode") === "admin";
 const DEFAULT_DB_LABEL = useSharedDb ? DATA_DIR : "in-memory";
@@ -323,6 +340,8 @@ worker({
 /**
  * Creates a database: private in-memory PGlite by default, or a shared
  * PGliteWorker + IndexedDB instance when ?shared=1 is present.
+ * Shared instances are keyed by location.pathname (via DB_ID), so only
+ * tabs/iframes on the same path share one database.
  * @param {{ loadDataDir?: Blob | File }} [options] - Extra PGlite options (e.g. tarball load).
  */
 async function createDatabase(options = {}) {
