@@ -38,6 +38,8 @@ let erdZoom = 1;
 let erdPositions = new Map();
 /** @type {{ nodes: Map<string, any>, relationships: Array<any> } | null} */
 let erdState = null;
+/** Whether the schema/ERD view has already been shown for the currently loaded database. */
+let hasShownSchemaForCurrentDb = false;
 /** @type {{ tableName: string, offsetX: number, offsetY: number, pointerId: number } | null} */
 let erdDrag = null;
 /** @type {{ distance: number, zoom: number } | null} Active touch pinch session. */
@@ -96,6 +98,7 @@ const el = {
   dbLoadingOverlay: document.getElementById("db-loading-overlay"),
   dbLoadingTitle: document.getElementById("db-loading-title"),
   dbLoadingSubtitle: document.getElementById("db-loading-subtitle"),
+  brandName: document.getElementById("brand-name"),
 };
 
 applyTheme(getPreferredTheme());
@@ -108,9 +111,15 @@ function setStatus(text) {
   el.statusText.textContent = text;
 }
 
+function stripFileExtension(name) {
+  return name.replace(/\.(tar\.gz|tgz|[a-z0-9]+)$/i, "");
+}
+
 function setDbLabel(label) {
   currentFileLabel = label;
-  el.dbName.textContent = label;
+  const displayLabel = stripFileExtension(label);
+  el.dbName.textContent = displayLabel;
+  el.brandName.textContent = displayLabel;
 }
 
 function setMenuOpen(isOpen) {
@@ -350,11 +359,16 @@ function bindLeaderChange(instance) {
  * Replaces the active database handle and refreshes UI.
  * @param {() => Promise<object>} factory - Async factory that returns a DB client.
  * @param {string} label - Label shown in the status bar.
+ * @param {{ showLoadingOverlay?: boolean }} [options] - Set showLoadingOverlay to
+ *   false for blank/fresh database creation, which is effectively instant and
+ *   isn't "loading" anything.
  */
-async function switchDatabase(factory, label) {
+async function switchDatabase(factory, label, { showLoadingOverlay = true } = {}) {
   setBusy(true);
   setStatus("Loading database…");
-  setDataLoading(true, label && label !== "in-memory" ? `Loading "${label}"…` : "Loading database…");
+  if (showLoadingOverlay) {
+    setDataLoading(true, label && label !== "in-memory" ? `Loading "${label}"…` : "Loading database…");
+  }
   try {
     const next = await factory();
     if (pg) {
@@ -366,6 +380,9 @@ async function switchDatabase(factory, label) {
     }
     pg = next;
     bindLeaderChange(pg);
+    hasShownSchemaForCurrentDb = false;
+    erdState = null;
+    erdPositions = new Map();
     setDbLabel(label);
     setStatus("Ready");
     await refreshTables();
@@ -376,13 +393,13 @@ async function switchDatabase(factory, label) {
     showToast("Could not load database: " + err.message, "error");
   } finally {
     setBusy(false);
-    setDataLoading(false);
+    if (showLoadingOverlay) setDataLoading(false);
   }
 }
 
 async function importIntoCurrentDatabase(file) {
   if (!pg) {
-    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
   }
 
   const kind = extOf(file.name);
@@ -723,7 +740,7 @@ async function refreshTables() {
     });
 
     if (resultsViewMode === "erd") {
-      renderErd().catch(console.error);
+      renderErd({ rebuild: true }).catch(console.error);
     }
   } catch (err) {
     console.error(err);
@@ -813,6 +830,10 @@ function setResultsView(mode) {
   el.erdToolbar.hidden = !showingErd;
 
   if (showingErd) {
+    if (!hasShownSchemaForCurrentDb) {
+      hasShownSchemaForCurrentDb = true;
+      firstBuildOfSchema();
+    }
     renderErd().catch((err) => {
       console.error(err);
       el.resultsBody.className = "results-body has-error";
@@ -963,6 +984,13 @@ function clearQueryHistory() {
   saveQueryHistory([]);
   if (resultsViewMode === "history") renderQueryHistory();
   showToast("Query history cleared");
+}
+
+/**
+ * Runs the first time the schema/ERD view is shown for a loaded database.
+ */
+function firstBuildOfSchema() {
+  console.log("Showing schema for the first time");
 }
 
 /**
@@ -1689,18 +1717,62 @@ function logErdTablePositions() {
 }
 
 /**
- * Positions ERD tables from an object shaped like `{ [tableName]: { x, y } }`
- * (as produced by `logErdTablePositions`) and re-renders the diagram.
+ * Merges an object shaped like `{ [tableName]: { x, y } }` (as produced by
+ * `logErdTablePositions`) into `erdPositions`, without re-rendering.
  * @param {Record<string, { x: number, y: number }>} positions
  */
-function applyErdTablePositions(positions) {
+function mergeErdPositions(positions) {
   if (!positions || typeof positions !== "object") return;
   for (const [name, pos] of Object.entries(positions)) {
     if (pos && typeof pos.x === "number" && typeof pos.y === "number") {
       erdPositions.set(name, { x: pos.x, y: pos.y });
     }
   }
-  if (resultsViewMode === "erd") renderErd().catch(console.error);
+}
+
+/**
+ * Positions ERD tables from an object shaped like `{ [tableName]: { x, y } }`
+ * (as produced by `logErdTablePositions`) and re-renders the diagram.
+ * @param {Record<string, { x: number, y: number }>} positions
+ */
+function applyErdTablePositions(positions) {
+  mergeErdPositions(positions);
+  if (erdState) {
+    for (const node of erdState.nodes.values()) {
+      const pos = erdPositions.get(node.name);
+      if (pos) {
+        node.x = pos.x;
+        node.y = pos.y;
+      }
+    }
+  }
+  if (resultsViewMode === "erd") renderErdView();
+}
+
+/**
+ * Reads saved ERD table positions from a `system.erd` table, if one exists.
+ * That table is expected to hold a single row with a single column
+ * containing a JSON object shaped like `{ [tableName]: { x, y } }`
+ * (as produced by `logErdTablePositions`).
+ * @returns {Promise<Record<string, { x: number, y: number }> | null>}
+ */
+async function fetchErdPositionsFromDb() {
+  const { rows: matches } = await pg.query(
+    `select 1 from information_schema.tables where table_schema = 'system' and table_name = 'erd';`
+  );
+  if (!matches.length) return null;
+
+  const { rows, fields } = await pg.query(`select * from system.erd limit 1;`);
+  if (!rows.length || !fields.length) return null;
+
+  const raw = rows[0][fields[0].name];
+  if (raw == null) return null;
+  try {
+    return typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (err) {
+    console.error("Failed to parse system.erd positions", err);
+    return null;
+  }
 }
 window.applyErdTablePositions = applyErdTablePositions;
 
@@ -1951,31 +2023,57 @@ function bindErdZoomHandlers() {
 }
 
 /**
- * Fetches schema metadata and renders an ERD into the results pane.
+ * Fetches schema metadata (and any saved `system.erd` positions) and builds
+ * `erdState` from scratch. Does not touch the DOM.
+ * @returns {Promise<boolean>} Whether any tables were found.
  */
-async function renderErd() {
-  if (!pg) return;
+async function buildErdState() {
+  const schema = await fetchErdSchema();
+  if (!schema.tables.length) {
+    erdState = null;
+    return false;
+  }
 
+  mergeErdPositions(await fetchErdPositionsFromDb());
+
+  const { nodes } = layoutErdNodes(schema.tables, schema.relationships);
+  erdState = {
+    nodes,
+    relationships: schema.relationships,
+    tableCount: schema.tables.length,
+  };
+  return true;
+}
+
+/**
+ * Draws the current `erdState` into the results pane and (re)binds
+ * interaction handlers. Does not re-fetch anything from the database, so
+ * dragged positions and zoom made during the session are preserved.
+ */
+function renderErdView() {
   erdDrag = null;
   erdPinch = null;
   erdGestureStartZoom = null;
   erdSelectedRelIndex = null;
-  erdState = null;
   el.resultsBody.className = "results-body erd-body";
-  el.resultsBody.innerHTML = `<div class="empty-hint">Loading ERD…</div>`;
-  el.resultsMeta.textContent = "";
 
-  const schema = await fetchErdSchema();
-  if (!schema.tables.length) {
+  if (!erdState) {
     el.resultsBody.innerHTML = `<div class="empty-hint">No tables yet. Create or upload tables to see an ERD.</div>`;
     el.resultsMeta.textContent = "0 tables";
     return;
   }
 
-  const { nodes, width, height } = layoutErdNodes(schema.tables, schema.relationships);
-  erdState = { nodes, relationships: schema.relationships };
+  const { nodes, relationships, tableCount } = erdState;
+  let maxX = 0;
+  let maxY = 0;
+  for (const node of nodes.values()) {
+    maxX = Math.max(maxX, node.x + node.width);
+    maxY = Math.max(maxY, node.y + node.height);
+  }
+  const width = maxX + ERD_PAD_X;
+  const height = maxY + ERD_PAD_Y;
 
-  const relationshipsSvg = schema.relationships
+  const relationshipsSvg = relationships
     .map((rel, index) => renderErdRelationship(rel, nodes, index))
     .join("");
   const nodesSvg = [...nodes.values()].map((node) => renderErdNode(node)).join("");
@@ -1990,12 +2088,32 @@ async function renderErd() {
       </svg>
     </div>`;
 
-  const relCount = schema.relationships.length;
-  el.resultsMeta.textContent = `${schema.tables.length} table(s) · ${relCount} relationship(s)`;
+  const relCount = relationships.length;
+  el.resultsMeta.textContent = `${tableCount} table(s) · ${relCount} relationship(s)`;
   bindErdDragHandlers();
   bindErdRelationshipHandlers();
   bindErdZoomHandlers();
   applyErdZoom();
+}
+
+/**
+ * Shows the ERD view. Schema (and saved positions) are only fetched the
+ * first time it's shown for the currently loaded database, or when
+ * `rebuild` is requested (e.g. via the refresh button) — otherwise the
+ * existing `erdState` is redrawn as-is, preserving any user dragging.
+ * @param {{ rebuild?: boolean }} [opts]
+ */
+async function renderErd({ rebuild = false } = {}) {
+  if (!pg) return;
+
+  if (rebuild || !erdState) {
+    el.resultsBody.className = "results-body erd-body";
+    el.resultsBody.innerHTML = `<div class="empty-hint">Loading ERD…</div>`;
+    el.resultsMeta.textContent = "";
+    await buildErdState();
+  }
+
+  renderErdView();
 }
 
 // ---- Upload / Download -----------------------------------------------------
@@ -2160,7 +2278,7 @@ function extOf(name) {
 async function importGistCsvs(gistId) {
   if (!gistId || !gistId.trim()) throw new Error("Please provide a gist ID.");
   if (!pg) {
-    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
   }
 
   const id = gistId.trim();
@@ -2253,23 +2371,32 @@ function base64ToBytes(base64) {
   return bytes;
 }
 
+/**
+ * Checks whether the current connection's public schema has no tables yet.
+ */
+async function isDatabaseEmpty() {
+  if (!pg) return true;
+  const { rows } = await pg.query(
+    `select count(*)::int as count from information_schema.tables where table_schema = 'public';`
+  );
+  return rows[0]?.count === 0;
+}
+
 // Fetch every URL in `urls` in parallel, then assemble them in listed order
 // (positional, regardless of which fetch actually resolved first) and hand
 // the result to handleUpload() exactly as if it had been picked via "Upload DB".
-async function loadDataFromUrls(label, urls, erd_url) {
+async function loadDataFromUrls(label, urls) {
+  // In shared mode another tab may have already loaded this data - avoid
+  // wiping and reloading it out from under them.
+  if (useSharedDb && !(await isDatabaseEmpty())) return;
+
   setBusy(true);
   setDataLoading(true, `Fetching "${label}"…`);
   setStatus(`Fetching "${label}"…`);
   try {
-    const [resolvedPieces, erdLayout] = await Promise.all([
-      Promise.all(urls.map((url, index) => fetchDataPiece(url).then((piece) => ({ index, piece })))),
-      erd_url
-        ? fetch(erd_url).then((response) => {
-            if (!response.ok) throw new Error(`HTTP ${response.status} for ${erd_url}`);
-            return response.json();
-          })
-        : Promise.resolve(null),
-    ]);
+    const resolvedPieces = await Promise.all(
+      urls.map((url, index) => fetchDataPiece(url).then((piece) => ({ index, piece })))
+    );
     const pieces = resolvedPieces
       .sort((a, b) => a.index - b.index)
       .map((entry) => entry.piece);
@@ -2286,12 +2413,9 @@ async function loadDataFromUrls(label, urls, erd_url) {
         ? new File([base64ToBytes(combinedText)], `${label}.tar.gz`)
         : new File([combinedText], `${label}.sql`, { type: "text/plain" });
     }
-    console.log("urls",urls)
-    console.log("erdLayout",erdLayout,erdLayout.feed.entry[0].content.$t)
     await wipeCurrentDatabaseStore();
-    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
     await handleUpload(file);
-    if (erdLayout) applyErdTablePositions(JSON.parse(erdLayout.feed.entry[0].content.$t));
     runQuery()
   } catch (err) {
     console.error(err);
@@ -2306,9 +2430,8 @@ async function loadDataFromUrls(label, urls, erd_url) {
 // Register an entry in the "Load Data" submenu. `label` is the text shown to
 // the user; `url` is a relative path (or an array of them, fetched in
 // parallel and assembled in listed order) handed to handleUpload() exactly
-// as if that data had been picked via "Upload DB". `erd_url`, if given, points
-// to a JSON object of ERD table positions applied once the data loads.
-function addLoadDataOption(label, url, erd_url) {
+// as if that data had been picked via "Upload DB".
+function addLoadDataOption(label, url) {
   const urls = Array.isArray(url) ? url : [url];
 
   el.loadDataSection.hidden = false;
@@ -2319,7 +2442,7 @@ function addLoadDataOption(label, url, erd_url) {
   btn.textContent = label;
   btn.addEventListener("click", () => {
     setMenuOpen(false);
-    loadDataFromUrls(label, urls, erd_url);
+    loadDataFromUrls(label, urls);
   });
   el.loadDataSubmenu.appendChild(btn);
   return btn;
@@ -2589,7 +2712,7 @@ function initEventListeners() {
     if (confirm("Start a new, empty database? Any unsaved changes will be lost.")) {
       (async () => {
         await wipeCurrentDatabaseStore();
-        await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
+        await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
       })();
     }
   });
@@ -2608,7 +2731,7 @@ function initEventListeners() {
   el.erdZoomIn.addEventListener("click", () => changeErdZoom(ERD_ZOOM_STEP));
   el.erdZoomOut.addEventListener("click", () => changeErdZoom(-ERD_ZOOM_STEP));
   el.erdRefresh.addEventListener("click", () => {
-    if (resultsViewMode === "erd") renderErd().catch(console.error);
+    if (resultsViewMode === "erd") renderErd({ rebuild: true }).catch(console.error);
   });
   el.erdLogPositions.addEventListener("click", () => logErdTablePositions());
 
@@ -2625,7 +2748,7 @@ async function main() {
   initEventListeners();
   initResizer();
   await initMonaco();
-  await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL);
+  await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
   applySqlUrlParameter();
 }
 
