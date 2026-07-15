@@ -247,6 +247,7 @@ function applySqlUrlParameter() {
   const value = params.get("sql");
   if (value !== null) {
     editor.setValue(value);
+    runQuery();
   }
 }
 
