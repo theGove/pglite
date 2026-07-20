@@ -7,6 +7,8 @@ const PGLITE_WORKER_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${P
 const THEME_KEY = "pglite-theme";
 const QUERY_HISTORY_KEY = "websql-query-history";
 const QUERY_HISTORY_MAX = 50;
+/** Result sets larger than this are split into pages in the results table. */
+const RESULTS_PAGE_SIZE = 1000;
 /** Enable multi-tab shared DB with ?shared=1 */
 const SHARED_DB_PARAM = "shared";
 const useSharedDb = new URLSearchParams(window.location.search).get(SHARED_DB_PARAM) === "1";
@@ -15,13 +17,296 @@ const useReadOnly = new URLSearchParams(window.location.search).get("readonly") 
 /** Compact embed chrome when ?style=minimal */
 const isMinimalStyle = new URLSearchParams(window.location.search).get("style") === "minimal";
 /**
+ * Defers booting the PGlite engine until the learner clicks Run when ?result=
+ * is present. The editor loads normally and shows the `sql` param's query,
+ * but nothing touches the database until an explicit run. Meanwhile the
+ * `result` value is used as a websqldata.blogspot.com post label (see
+ * loadResultFromBlog) to fetch and display a canned result in its place.
+ */
+const useDeferredDb = new URLSearchParams(window.location.search).has("result");
+/** Blogger post label to fetch a canned query result from; see loadResultFromBlog. */
+const resultLabel = new URLSearchParams(window.location.search).get("result");
+/** Max time to wait for the shared DB's cross-tab leader-election handshake before giving up. */
+const DB_READY_TIMEOUT_MS = 10000;
+/** How long the splash screen shows before revealing its "Retry" button, in case boot is stuck somewhere no timeout above covers. */
+const SPLASH_RETRY_REVEAL_MS = 10000;
+
+
+
+//for getting data from websqldata.blogspot.com
+let scriptFragments=null
+let postsFetched=null
+let currentLabel = null
+let dataCallback= null
+const metadata=[]
+
+
+
+function loadBloggerFeed(label,callback,bloggerStartIndex = 1, isNextPage = false) {
+  if(callback){
+    scriptFragments={}
+    postsFetched=0
+    dataCallback=callback
+    metadata.length=0
+  }
+  currentLabel=label 
+  const script = document.createElement('script');
+  script.src = `https://websqldata.blogspot.com/feeds/posts/default/-/${label}?alt=json-in-script&start-index=${bloggerStartIndex}&callback=handleFeed`;
+//  script.id = 'blogger-jsonp-script';
+  
+//  const existing = document.getElementById('blogger-jsonp-script');
+//  if (existing){existing.remove()}
+  document.head.appendChild(script);
+}
+
+function handleFeed(json) {
+  const entries = json.feed.entry || [];
+  if(entries.length>0){  
+    postsFetched += entries.length
+    entries.forEach(entry => {    
+      for(const cat of entry.category){
+        //console.log("cat",cat, entry.title.$t)
+        if(isNaN(cat.term)){
+          // this could be the search term or the description of the dataset
+          if(cat.term==="metadata"){
+            const meta=JSON.parse(entry.content.$t)
+            meta.label=firstLabelExcept(entry.category, "metadata")
+            metadata.push(meta)
+          }
+        }else{  
+          scriptFragments[cat.term]=entry.content.$t
+          
+        }
+      }
+    });
+    // done scanning labels, now figure out which label we searched for
+
+    //console.log("scriptFragments -------------- ",JSON.stringify(Object.keys(scriptFragments),null,2))
+    //console.log("scriptFragments length-------------- ",Object.keys(scriptFragments).length)
+   
+    const startIndex = postsFetched+1
+    //console.log("startIndex -------------- ",startIndex)
+    
+    loadBloggerFeed(currentLabel,null,startIndex, true);
+    
+  } else {
+    //console.log("All posts loaded successfully.",scriptFragments);
+    if(Object.keys(scriptFragments).length===0){
+      // assume we are getting metadata
+      dataCallback(metadata)
+    }else{
+      // we have gotten the data      
+      const order=Object.keys(scriptFragments).map(Number).sort((a,b)=>a-b)
+      for(let x=0;x<order.length;x++){
+        order[x]=scriptFragments[order[x]]
+      }
+      //console.log("order.join",order.join("\n"))
+      dataCallback(order.join("\n"))
+    }
+  }
+  function firstLabelExcept(category, exclusion){
+    for(const cat of category){
+      if(cat.term!==exclusion){
+        return cat.term;
+      }  
+    }
+  }  
+}
+  
+/** Resolves loadDataFromBlog's in-flight promise (see getDataFromBlog); JSONP has no return value to await, so completion is signaled through this instead. */
+let dataLoadCompleteResolve = null;
+
+/**
+ * Fetches and loads dataset `label` from the blog, returning a promise that
+ * settles once loadDataFromBlog has fully finished (script executed, table
+ * list refreshed) - not just once the fetch was kicked off. Callers that
+ * need to run a query against the loaded data (e.g. ensureDeferredDbBooted)
+ * must await this, or they'll run against a database that hasn't been
+ * populated yet.
+ */
+function getDataFromBlog(label){
+   setBusy(true);
+   setDataLoading(true, `Fetching "${label}"…`);
+   setStatus(`Fetching "${label}"…`);
+   loadBloggerFeed(label,loadDataFromBlog)
+   return new Promise((resolve) => { dataLoadCompleteResolve = resolve; });
+}
+async function loadDataFromBlog(script){
+  if(!script){
+    setDataLoading(false);
+    setBusy(false);
+    dataLoadCompleteResolve?.();
+    dataLoadCompleteResolve = null;
+    return;
+  }
+  //console.log("script:",script)
+  try {
+    await wipeCurrentDatabaseStore();
+    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
+    await pg.exec(script);
+    await recordLoadedDatasetLabel(currentLabel);
+    setDbLabel(currentLabel);
+    await refreshTables();
+    clearResults("Run a query to see results here.");
+    await maybeSetDatabaseReadOnly();
+    setDataUrlParam(currentLabel);
+    showToast(`Loaded "${currentLabel}"`, "success");
+  } catch (err) {
+    console.error(err);
+    setStatus("Ready");
+    showToast(`Could not load "${currentLabel}": ${err.message}`, "error");
+  } finally {
+    setDataLoading(false);
+    setBusy(false);
+    dataLoadCompleteResolve?.();
+    dataLoadCompleteResolve = null;
+  }
+}
+
+/** Timestamp captured right before fetching a canned result post; read by handleResultFeed once the JSONP callback fires. */
+let resultFetchStartedAt = null;
+
+/** Dataset label from the fetched canned result's `data` property; used by applyDataUrlParameter when the `data` URL parameter itself is absent. */
+let resultDataFallback = null;
+
+/**
+ * Fetches the single post tagged `label` from websqldata.blogspot.com, using
+ * the same JSONP script-tag technique as loadBloggerFeed, and renders its
+ * content as a canned query result (see downloadResultAsJson for the shape)
+ * before the PGlite engine has booted. Unlike loadBloggerFeed's chunked SQL
+ * scripts, this assumes exactly one post carries the label - result sets
+ * previewed this way are small, so there's no need to split them across
+ * posts or paginate the feed.
+ */
+function loadResultFromBlog(label) {
+  resultFetchStartedAt = performance.now();
+  const script = document.createElement("script");
+  script.src = `https://websqldata.blogspot.com/feeds/posts/default/-/${label}?alt=json-in-script&max-results=1&callback=handleResultFeed`;
+  document.head.appendChild(script);
+}
+
+function handleResultFeed(json) {
+  const elapsedMs = Math.round(performance.now() - resultFetchStartedAt);
+  const entries = json.feed.entry || [];
+  if (entries.length === 0) {
+    setStatus("Ready");
+    showToast(`No canned result found for "${resultLabel}"`, "error");
+    return;
+  }
+  try {
+    const result = JSON.parse(entries[0].content.$t);
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("sql") && result.sql && editor) {
+      editor.setValue(result.sql);
+      shrinkEditorToFitQuery();
+    }
+    if (!params.has("data") && result.data) {
+      resultDataFallback = result.data;
+    }
+    renderResults([result], elapsedMs);
+    setStatus("Ready");
+  } catch (err) {
+    console.error(err);
+    setStatus("Ready");
+    showToast(`Could not parse canned result for "${resultLabel}": ${err.message}`, "error");
+  }
+}
+
+
+function showDatasets(data){
+  if(data){
+    //console.log("data",data)
+    // we have fetched the data, show it as a modal listing each dataset
+    const overlay = document.createElement("div");
+    overlay.className = "loading-overlay dataset-modal-overlay";
+
+    const dialog = document.createElement("div");
+    dialog.className = "loading-dialog dataset-modal-dialog";
+
+    const closeModal = () => overlay.remove();
+
+    const sortedData = [...data].sort((a, b) =>
+      (a.title || a.label || "").localeCompare(b.title || b.label || "", undefined, { sensitivity: "base" })
+    );
+
+    const itemsHtml = sortedData.map(ds => {
+      const label = ds.label || "";
+      const title = ds.title || label || "Untitled dataset";
+      const description = escapeHtml(ds.description || "").replace(/\r\n|\r|\n/g, "<br>");
+      return `
+        <div class="dataset-modal-item">
+          <button type="button" class="dataset-modal-title" data-label="${escapeHtml(label)}">${escapeHtml(title)}</button>
+          <div class="dataset-modal-description" hidden>
+            ${description}
+            <div class="dataset-modal-actions">
+              <button type="button" class="btn btn-primary btn-sm dataset-modal-load-btn" data-label="${escapeHtml(label)}">
+                <span class="spinner spinner-btn" hidden aria-hidden="true"></span>
+                Load Dataset
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+
+    dialog.innerHTML = `
+      <div class="dataset-modal-content">
+        <div class="dataset-modal-header">
+          <div class="loading-dialog-title">Available Datasets</div>
+          <button type="button" class="icon-btn dataset-modal-close" aria-label="Close">✕</button>
+        </div>
+        <div class="dataset-modal-list">${itemsHtml || "<p>No datasets found.</p>"}</div>
+      </div>`;
+
+    dialog.querySelector(".dataset-modal-close").addEventListener("click", closeModal);
+    dialog.querySelectorAll(".dataset-modal-title").forEach((toggle) => {
+      toggle.addEventListener("click", () => {
+        const item = toggle.closest(".dataset-modal-item");
+        const desc = item.querySelector(".dataset-modal-description");
+        if (desc) desc.hidden = !desc.hidden;
+      });
+    });
+    dialog.querySelectorAll(".dataset-modal-load-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const label = btn.getAttribute("data-label") || "";
+        const spinner = btn.querySelector(".spinner");
+        if (spinner) spinner.hidden = false;
+        closeModal();
+        getDataFromBlog(label);
+      });
+    });
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) closeModal();
+    });
+    document.addEventListener("keydown", function onKeydown(e) {
+      if (e.key === "Escape") {
+        closeModal();
+        document.removeEventListener("keydown", onKeydown);
+      }
+    });
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+  }else{
+    //no data, we need to fetch it
+    loadBloggerFeed('metadata',showDatasets)
+  }
+}
+  
+  
+// end of getting data from websqldata.blogspot.com
+
+
+
+
+
+/**
  * Builds a stable IndexedDB / worker id from the page pathname so shared
  * mode only syncs tabs/iframes that share the same location.pathname.
  * @param {string} pathname - window.location.pathname
  */
 function sharedDbIdForPathname(pathname) {
   const path = (pathname || "/").replace(/\/+$/, "") || "/";
-  console.log("path", path);
+  //console.log("path", path);
   if (path === "/") return "websql-studio";
   const safe = path
     .replace(/^\/+/, "")
@@ -48,6 +333,7 @@ let editor = null;
 let monacoRef = null;
 let currentFileLabel = DEFAULT_DB_LABEL;
 let currentResultSets = [];
+let currentResultSetsSql = "";
 let columnsCache = new Map();
 let dataLoadingDepth = 0;
 let unsubLeaderChange = null;
@@ -71,6 +357,8 @@ let erdSelectedRelIndex = null;
 let lastResultsHtml = `<div class="empty-hint">Run a query to see results here.</div>`;
 let lastResultsMeta = "";
 let lastResultsClassName = "results-body";
+/** Current (0-based) page number per result-set index, for result sets over RESULTS_PAGE_SIZE rows. */
+let resultPageByIdx = new Map();
 
 // ---- DOM refs -------------------------------------------------------------
 
@@ -90,10 +378,8 @@ const el = {
   themeIcon: document.getElementById("theme-icon"),
   themeLabel: document.getElementById("theme-label"),
   menuClear: document.getElementById("menu-clear"),
-  loadDataSection: document.getElementById("load-data-section"),
-  loadDataSeparator: document.getElementById("load-data-separator"),
-  loadDataToggle: document.getElementById("menu-load-data"),
-  loadDataSubmenu: document.getElementById("load-data-submenu"),
+  menuAbout: document.getElementById("menu-about"),
+  menuLoadData: document.getElementById("menu-load-data"),
   fileInput: document.getElementById("file-input"),
   refreshTables: document.getElementById("btn-refresh-tables"),
   toggleSidebar: document.getElementById("btn-toggle-sidebar"),
@@ -121,6 +407,9 @@ const el = {
   dbLoadingTitle: document.getElementById("db-loading-title"),
   dbLoadingSubtitle: document.getElementById("db-loading-subtitle"),
   brandName: document.getElementById("brand-name") || document.querySelector(".brand-name"),
+  splash: document.getElementById("splash"),
+  splashRetry: document.getElementById("splash-retry"),
+  appShell: document.getElementById("app-shell"),
 };
 
 applyTheme(getPreferredTheme());
@@ -152,11 +441,6 @@ function setDbLabel(label) {
 function setMenuOpen(isOpen) {
   el.menuPanel.hidden = !isOpen;
   el.menuButton.setAttribute("aria-expanded", String(isOpen));
-  if (!isOpen && el.loadDataToggle) {
-    el.loadDataSubmenu.hidden = true;
-    el.loadDataToggle.setAttribute("aria-expanded", "false");
-    el.loadDataToggle.querySelector(".menu-caret").textContent = "▸";
-  }
 }
 
 // ---- Theme -----------------------------------------------------------------
@@ -204,6 +488,30 @@ function setBusy(isBusy) {
   if (runIcon) runIcon.hidden = isBusy;
   if (runSpinner) runSpinner.hidden = !isBusy;
   el.menuButton.disabled = isBusy;
+}
+
+let splashRetryTimer = null;
+
+function hideSplash() {
+  if (splashRetryTimer) {
+    clearTimeout(splashRetryTimer);
+    splashRetryTimer = null;
+  }
+  if (el.splash) el.splash.style.display = "none";
+  if (el.appShell) el.appShell.style.display = "";
+}
+
+/**
+ * Reveals the splash screen's "Retry" button after SPLASH_RETRY_REVEAL_MS if
+ * the splash is still showing by then. A manual escape hatch for boot hangs
+ * that aren't covered by the DB creation/readiness timeouts (e.g. a stuck
+ * Monaco load, or anything else upstream of switchDatabase()).
+ */
+function scheduleSplashRetryReveal() {
+  splashRetryTimer = setTimeout(() => {
+    splashRetryTimer = null;
+    if (el.splashRetry) el.splashRetry.hidden = false;
+  }, SPLASH_RETRY_REVEAL_MS);
 }
 
 function setStatusBarVisible(isVisible) {
@@ -264,11 +572,14 @@ function initMonaco() {
         scrollBeyondLastLine: false,
         wordWrap: "on",
       });
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runQuery());
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => userRunQuery());
       resolve();
     });
   });
 }
+
+/** Retry interval for the initial `sql` URL parameter's auto-run; see runInitialSqlQuery. */
+const INITIAL_SQL_RETRY_MS = 3000;
 
 function applySqlUrlParameter() {
   if (!editor) return;
@@ -279,8 +590,142 @@ function applySqlUrlParameter() {
   const value = params.get("sql");
   if (value !== null) {
     editor.setValue(value);
-    runQuery();
+    if (!useDeferredDb) {
+      runInitialSqlQuery();
+    }
   }
+}
+
+/**
+ * Runs the `sql` URL parameter's query, retrying every INITIAL_SQL_RETRY_MS
+ * until it succeeds. Covers the case where the automatic initial run fires
+ * before the (possibly shared) database connection is actually usable and
+ * shows an error the user never asked for. Stops as soon as the user runs a
+ * query themselves, so it never clobbers something they've typed or run.
+ */
+async function runInitialSqlQuery() {
+  if (userHasRunQuery) return;
+  if (!pg) {
+    setTimeout(runInitialSqlQuery, INITIAL_SQL_RETRY_MS);
+    return;
+  }
+  await runQuery();
+  if (!userHasRunQuery && lastResultsClassName.includes("has-error")) {
+    setTimeout(runInitialSqlQuery, INITIAL_SQL_RETRY_MS);
+  }
+}
+
+/**
+ * Loads a dataset published on websqldata.blogspot.com when the page is
+ * opened with a `data` URL parameter (e.g. the "Load Data" modal's links to
+ * `/2000/03/blank.html?data=<label>`). Falls back to the `data` label
+ * recorded on a fetched canned `result` object (see handleResultFeed) when
+ * the URL parameter itself is omitted.
+ *
+ * Checks the currently-attached database for that same label (see
+ * getLoadedDatasetLabel) before fetching anything - the shared idb:// store
+ * persists across reloads, so a reload with the same `data` param would
+ * otherwise re-run the load script against tables it already created,
+ * failing with "relation already exists" on the first CREATE TABLE.
+ */
+async function applyDataUrlParameter() {
+  const params = new URLSearchParams(window.location.search);
+  const label = params.get("data") || resultDataFallback;
+  if (!label) return;
+  if ((await getLoadedDatasetLabel()) === label) {
+    currentLabel = label;
+    setDbLabel(label);
+    setDataUrlParam(label);
+    return;
+  }
+  await getDataFromBlog(label);
+}
+
+/** Schema used for this app's own bookkeeping tables, kept out of the public schema so it never shows up in the table list/ERD or collides with a dataset's own tables. */
+const APP_META_SCHEMA = "_websql_studio";
+const LOADED_DATASET_TABLE = `${APP_META_SCHEMA}.loaded_dataset`;
+
+/**
+ * Reads the blog dataset label recorded on the currently-attached database
+ * by recordLoadedDatasetLabel, or null if none is recorded (fresh/empty
+ * store, or one populated some other way - file import, manual SQL, etc.).
+ */
+async function getLoadedDatasetLabel() {
+  if (!pg) return null;
+  try {
+    const { rows } = await pg.query(`select label from ${LOADED_DATASET_TABLE} limit 1;`);
+    return rows[0]?.label ?? null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Records that `label` is the blog dataset now loaded into the current database, for getLoadedDatasetLabel to check on a future reload. */
+async function recordLoadedDatasetLabel(label) {
+  if (!pg) return;
+  try {
+    await pg.exec(
+      `create schema if not exists ${APP_META_SCHEMA};
+       create table if not exists ${LOADED_DATASET_TABLE} (label text);
+       delete from ${LOADED_DATASET_TABLE};`
+    );
+    await pg.query(`insert into ${LOADED_DATASET_TABLE} (label) values ($1);`, [label]);
+  } catch (err) {
+    console.error("Failed to record loaded dataset label", err);
+  }
+}
+
+/**
+ * Rejects with `message` if `promise` hasn't settled within `ms`. Used to
+ * turn a stuck cross-tab coordination handshake into a visible, recoverable
+ * failure instead of leaving the UI waiting forever.
+ */
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+/**
+ * Waits until `pg` is actually ready to run queries. PGliteWorker.create()
+ * can resolve before the instance has finished connecting to the leader (or,
+ * for the leader itself, before its local PGlite is ready) — `waitReady`
+ * resolves once that settles. Plain (non-shared) PGlite instances don't
+ * expose it and are already ready by the time create() resolves.
+ * Bounded by DB_READY_TIMEOUT_MS so a stuck cross-tab handshake (e.g. one of
+ * several simultaneously-booting iframes never completing leader election)
+ * surfaces as an error instead of hanging the caller forever.
+ */
+async function waitForDbReady() {
+  if (pg && "waitReady" in pg) {
+    await withTimeout(
+      pg.waitReady,
+      DB_READY_TIMEOUT_MS,
+      "Timed out waiting for the shared database connection to become ready. Try reloading this frame."
+    );
+  }
+}
+
+/**
+ * Updates the `data` URL parameter to reflect the dataset currently loaded,
+ * leaving every other URL parameter untouched, so copying the address bar
+ * gives a direct link back to this dataset. Uses replaceState so loading
+ * datasets one after another doesn't pile up browser history entries.
+ */
+function setDataUrlParam(label) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("data", label);
+  window.history.replaceState(window.history.state, "", url);
 }
 
 /**
@@ -349,22 +794,106 @@ worker({
 }
 
 /**
+ * Serializes an async operation across same-origin tabs/iframes using the
+ * Web Locks API, keyed by `id`. Whoever asks first runs `fn` immediately;
+ * everyone else queues and only starts once the current holder's `fn`
+ * promise has settled. Falls back to running `fn` directly if Web Locks
+ * isn't available.
+ * Bounded by DB_READY_TIMEOUT_MS: the lock is released after that timeout
+ * even if `fn` never settles (e.g. a dedicated worker that never boots), so
+ * one stuck instance can't starve every other instance queued behind it on
+ * the same lock - only its own attempt fails/surfaces as an error.
+ * @param {string} id - Lock name scope (e.g. DB_ID).
+ * @param {() => Promise<any>} fn - Async operation to serialize.
+ */
+function withInitLock(id, fn) {
+  if (!("locks" in navigator)) return fn();
+  return new Promise((resolve, reject) => {
+    navigator.locks
+      .request(`pglite-init:${id}`, () =>
+        withTimeout(fn(), DB_READY_TIMEOUT_MS, "Timed out creating the shared database connection.").then(
+          resolve,
+          reject
+        )
+      )
+      .catch(reject);
+  });
+}
+
+/**
+ * Claims a persistent, never-released Web Lock scoped to `id`. The first
+ * caller (across all same-origin tabs/iframes) to request it gets it and
+ * holds it for the lifetime of this page/frame; the browser releases it
+ * automatically when this browsing context goes away (tab close, navigation,
+ * or the iframe being removed). Everyone else's `{ ifAvailable: true }`
+ * request comes back empty-handed as soon as the first caller holds it, so
+ * this doubles as a durable "am I the primary instance?" flag - unlike
+ * PGliteWorker's own internal leader state, which this code doesn't read
+ * because its exact readiness/timing isn't part of PGlite's documented API.
+ * Falls back to `true` (best effort, uncoordinated) if Web Locks isn't
+ * available.
+ * @param {string} id - Lock name scope (e.g. DB_ID).
+ */
+function claimPrimaryRole(id) {
+  if (!("locks" in navigator)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    navigator.locks
+      .request(`pglite-primary:${id}`, { ifAvailable: true }, (lock) => {
+        if (!lock) {
+          resolve(false);
+          return;
+        }
+        resolve(true);
+        return new Promise(() => {}); // hold the lock until this context is torn down
+      })
+      .catch(() => resolve(false));
+  });
+}
+
+/**
+ * Caches claimPrimaryRole's result for the lifetime of this page. The lock it
+ * requests is held forever once granted (see claimPrimaryRole), so a second
+ * request for the same id - e.g. createDatabase() running again for a data
+ * reload after the first call already claimed it - would find its own lock
+ * unavailable and wrongly resolve false. Every createDatabase() call reuses
+ * this instead of re-requesting the lock.
+ */
+let primaryRoleClaim = null;
+function claimPrimaryRoleOnce(id) {
+  if (!primaryRoleClaim) primaryRoleClaim = claimPrimaryRole(id);
+  return primaryRoleClaim;
+}
+
+/** Set once per page load by createDatabase(); see claimPrimaryRole(). */
+let isPrimaryInstance = false;
+
+/**
  * Creates a database: private in-memory PGlite by default, or a shared
  * PGliteWorker + IndexedDB instance when ?shared=1 is present.
  * Shared instances are keyed by location.pathname (via DB_ID), so only
  * tabs/iframes on the same path share one database.
+ * Shared creation is serialized via withInitLock so that when several
+ * iframes/tabs boot at once, one becomes primary and finishes creating the
+ * PGliteWorker before the next one starts, instead of all racing at once.
+ * Primary status (see claimPrimaryRole) is decided inside that same
+ * serialized turn, so the first instance processed is always the one that
+ * wins it.
  * @param {{ loadDataDir?: Blob | File }} [options] - Extra PGlite options (e.g. tarball load).
  */
 async function createDatabase(options = {}) {
   if (useSharedDb) {
     const PGliteWorker = await loadPGliteWorker();
-    return PGliteWorker.create(createPGliteBlobWorker(), {
-      id: DB_ID,
-      dataDir: DATA_DIR,
-      ...options,
+    return withInitLock(DB_ID, async () => {
+      isPrimaryInstance = await claimPrimaryRoleOnce(DB_ID);
+      return PGliteWorker.create(createPGliteBlobWorker(), {
+        id: DB_ID,
+        dataDir: DATA_DIR,
+        ...options,
+      });
     });
   }
 
+  isPrimaryInstance = true;
   const PGlite = await loadPGlite();
   return PGlite.create(options);
 }
@@ -425,15 +954,17 @@ function bindLeaderChange(instance) {
  * Replaces the active database handle and refreshes UI.
  * @param {() => Promise<object>} factory - Async factory that returns a DB client.
  * @param {string} label - Label shown in the status bar.
- * @param {{ showLoadingOverlay?: boolean }} [options] - Set showLoadingOverlay to
- *   false for blank/fresh database creation, which is effectively instant and
- *   isn't "loading" anything.
+ * @param {{ showLoadingOverlay?: boolean, overlayText?: string }} [options] - Set
+ *   showLoadingOverlay to false for blank/fresh database creation, which is
+ *   effectively instant and isn't "loading" anything. Set overlayText to
+ *   override the default `Loading "${label}"…` text - e.g. when label is
+ *   the raw idb:// storage URI and a real dataset load is about to follow.
  */
-async function switchDatabase(factory, label, { showLoadingOverlay = true } = {}) {
+async function switchDatabase(factory, label, { showLoadingOverlay = true, overlayText } = {}) {
   setBusy(true);
   setStatus("Loading database…");
   if (showLoadingOverlay) {
-    setDataLoading(true, label && label !== "in-memory" ? `Loading "${label}"…` : "Loading database…");
+    setDataLoading(true, overlayText || (label && label !== "in-memory" ? `Loading "${label}"…` : "Loading database…"));
   }
   try {
     const next = await factory();
@@ -445,6 +976,7 @@ async function switchDatabase(factory, label, { showLoadingOverlay = true } = {}
       }
     }
     pg = next;
+    await waitForDbReady();
     bindLeaderChange(pg);
     hasShownSchemaForCurrentDb = false;
     erdState = null;
@@ -623,12 +1155,47 @@ function shrinkEditorToFitQuery() {
   }
 }
 
+/** True once the user has explicitly run a query themselves (Run button, Ctrl+Enter, clicking a table/history entry). */
+let userHasRunQuery = false;
+
+/**
+ * Resolves once the deferred database (see useDeferredDb) has booted. Null
+ * until the first Run triggers it; cached afterward so concurrent Run clicks
+ * (e.g. an impatient double-click while the engine is still booting) await
+ * the same boot instead of one of them racing ahead and running its query
+ * against a still-null `pg`.
+ */
+let deferredDbBootPromise = null;
+
+function ensureDeferredDbBooted() {
+  if (!useDeferredDb) return Promise.resolve();
+  if (!deferredDbBootPromise) {
+    deferredDbBootPromise = (async () => {
+      await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, {
+        showLoadingOverlay: true,
+        overlayText: "Preparing database…",
+      });
+      if (isPrimaryInstance) {
+        await applyDataUrlParameter();
+      }
+    })();
+  }
+  return deferredDbBootPromise;
+}
+
+/** Runs the query as an explicit user action; stops the initial `sql` URL parameter's auto-retry loop. */
+async function userRunQuery() {
+  userHasRunQuery = true;
+  await ensureDeferredDbBooted();
+  runQuery();
+}
+
 async function runQuery() {
   if (!pg) return;
   const sql = editor.getValue().trim();
   if (!sql) return;
 
-  console.log("Executing query:", sql);
+  //console.log("Executing query:", sql);
   shrinkEditorToFitQuery();
 
   setBusy(true);
@@ -640,6 +1207,7 @@ async function runQuery() {
       : await pg.exec(sql);
     const elapsed = Math.round(performance.now() - startedAt);
     addQueryHistoryEntry({ sql, ok: true, elapsedMs: elapsed });
+    currentResultSetsSql = sql;
     renderResults(results, elapsed);
     setStatus("Ready");
     refreshTables();
@@ -655,6 +1223,8 @@ async function runQuery() {
 
 function clearResults(message) {
   currentResultSets = [];
+  currentResultSetsSql = "";
+  resultPageByIdx = new Map();
   lastResultsHtml = `<div class="empty-hint">${escapeHtml(message)}</div>`;
   lastResultsMeta = "";
   lastResultsClassName = "results-body";
@@ -663,41 +1233,84 @@ function clearResults(message) {
 
 function renderError(err) {
   currentResultSets = [];
+  currentResultSetsSql = "";
+  resultPageByIdx = new Map();
   lastResultsHtml = `<div class="error-box">${escapeHtml(err.message || String(err))}</div>`;
   lastResultsMeta = "";
   lastResultsClassName = "results-body has-error";
   setResultsView("results");
 }
 
+function buildResultBlockHtml(res, i) {
+  const hasRows = res.fields && res.fields.length > 0;
+  const labelText = currentResultSets.length > 1 ? `Statement ${i + 1}` : "";
+  const csvBtn = hasRows
+    ? `<button class="csv-btn" data-idx="${i}" title="Download this result as CSV">⭳ CSV</button>`
+    : "";
+  const jsonBtn = hasRows && isAdminMode
+    ? `<button class="result-json-btn" data-idx="${i}" title="Download the raw pg.exec() result as JSON, for hosting as a canned preview">⭳ JSON</button>`
+    : "";
+  const actions = csvBtn || jsonBtn
+    ? `<div class="result-block-actions">${csvBtn}${jsonBtn}</div>`
+    : "";
+  const header = labelText || actions
+    ? `<div class="result-block-label"><span>${labelText}</span>${actions}</div>`
+    : "";
+  if (!hasRows) {
+    const affected = typeof res.affectedRows === "number" ? res.affectedRows : 0;
+    return `<div class="result-block">${header}<div class="empty-hint">OK — ${affected} row(s) affected.</div></div>`;
+  }
+
+  const totalRows = res.rows.length;
+  const totalPages = Math.max(1, Math.ceil(totalRows / RESULTS_PAGE_SIZE));
+  const page = Math.min(resultPageByIdx.get(i) || 0, totalPages - 1);
+  const start = page * RESULTS_PAGE_SIZE;
+  const pageRows = totalRows > RESULTS_PAGE_SIZE ? res.rows.slice(start, start + RESULTS_PAGE_SIZE) : res.rows;
+  const pager = totalRows > RESULTS_PAGE_SIZE ? renderPager(i, page, totalPages, totalRows, start, start + pageRows.length) : "";
+
+  return `<div class="result-block">${header}${renderTable(res, pageRows, start)}${pager}</div>`;
+}
+
+function renderPager(idx, page, totalPages, totalRows, rangeStart, rangeEnd) {
+  return `<div class="result-pager">
+    <span class="pager-info">Rows ${rangeStart + 1}–${rangeEnd} of ${totalRows}</span>
+    <div class="pager-controls">
+      <button class="page-btn" data-idx="${idx}" data-dir="prev" ${page === 0 ? "disabled" : ""}>‹ Prev</button>
+      <span class="pager-page">Page ${page + 1} of ${totalPages}</span>
+      <button class="page-btn" data-idx="${idx}" data-dir="next" ${page >= totalPages - 1 ? "disabled" : ""}>Next ›</button>
+    </div>
+  </div>`;
+}
+
 function renderResults(results, elapsedMs) {
   currentResultSets = results || [];
+  resultPageByIdx = new Map();
 
   if (!results || results.length === 0) {
     clearResults("No results.");
     return;
   }
 
-  const blocks = results.map((res, i) => {
-    const hasRows = res.fields && res.fields.length > 0;
-    const labelText = results.length > 1 ? `Statement ${i + 1}` : "";
-    const csvBtn = hasRows
-      ? `<button class="csv-btn" data-idx="${i}" title="Download this result as CSV">⭳ CSV</button>`
-      : "";
-    const header = labelText || csvBtn
-      ? `<div class="result-block-label"><span>${labelText}</span>${csvBtn}</div>`
-      : "";
-    if (hasRows) {
-      return `<div class="result-block">${header}${renderTable(res)}</div>`;
-    }
-    const affected = typeof res.affectedRows === "number" ? res.affectedRows : 0;
-    return `<div class="result-block">${header}<div class="empty-hint">OK — ${affected} row(s) affected.</div></div>`;
-  });
-
-  lastResultsHtml = blocks.join("");
+  lastResultsHtml = currentResultSets.map((res, i) => buildResultBlockHtml(res, i)).join("");
   const totalRows = results.reduce((sum, r) => sum + (r.rows ? r.rows.length : 0), 0);
   lastResultsMeta = `${totalRows} row(s) · ${elapsedMs} ms`;
   lastResultsClassName = "results-body";
   setResultsView("results");
+}
+
+function goToResultPage(idx, dir) {
+  const res = currentResultSets[idx];
+  if (!res || !res.rows) return;
+  const totalPages = Math.max(1, Math.ceil(res.rows.length / RESULTS_PAGE_SIZE));
+  const current = Math.min(resultPageByIdx.get(idx) || 0, totalPages - 1);
+  const next = dir === "next" ? current + 1 : current - 1;
+  if (next < 0 || next >= totalPages) return;
+  resultPageByIdx.set(idx, next);
+  lastResultsHtml = currentResultSets.map((res, i) => buildResultBlockHtml(res, i)).join("");
+  if (resultsViewMode === "results") {
+    el.resultsBody.innerHTML = lastResultsHtml;
+    markOverflowingCells();
+  }
 }
 
 function isNumericValue(value) {
@@ -710,25 +1323,40 @@ function formatDateValue(d) {
   return iso.replace("T", " ").replace("Z", "");
 }
 
-function renderTable(res) {
+function renderTable(res, rows, rowOffset) {
   const cols = res.fields.map((f) => f.name);
+  const displayRows = rows || res.rows;
+  const offset = rowOffset || 0;
   const head = `<tr><th class="row-num-col"></th>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr>`;
-  const body = res.rows
+  const body = displayRows
     .map((row, i) => {
       const cells = cols
         .map((c) => {
           const v = row[c];
           if (v === null || v === undefined) return `<td class="cell-null">null</td>`;
-          if (v instanceof Date) return `<td>${escapeHtml(formatDateValue(v))}</td>`;
-          if (typeof v === "object") return `<td>${escapeHtml(JSON.stringify(v))}</td>`;
+          const text = v instanceof Date ? formatDateValue(v) : typeof v === "object" ? JSON.stringify(v) : String(v);
           const cellClass = isNumericValue(v) ? "cell-numeric" : "";
-          return `<td class="${cellClass}">${escapeHtml(String(v))}</td>`;
+          return `<td class="cell-truncatable ${cellClass}"><span class="cell-text">${escapeHtml(text)}</span></td>`;
         })
         .join("");
-      return `<tr><td class="row-num-col">${i + 1}</td>${cells}</tr>`;
+      return `<tr><td class="row-num-col">${offset + i + 1}</td>${cells}</tr>`;
     })
     .join("");
   return `<table class="result-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function markOverflowingCells() {
+  const cells = el.resultsBody.querySelectorAll("td.cell-truncatable");
+  cells.forEach((td) => {
+    if (td.querySelector(".cell-expand-btn")) return;
+    const span = td.querySelector(".cell-text");
+    if (!span || span.scrollWidth <= span.clientWidth + 1) return;
+    const btn = document.createElement("button");
+    btn.className = "cell-expand-btn";
+    btn.title = "Show full text";
+    btn.textContent = "…";
+    td.appendChild(btn);
+  });
 }
 
 function escapeHtml(str) {
@@ -773,6 +1401,32 @@ function downloadResultAsCsv(idx) {
   showToast(`Downloaded "${filename}"`, "success");
 }
 
+/**
+ * Admin-only (?mode=admin): downloads the raw pg.exec() result for one
+ * statement as JSON, in the same { fields, rows, affectedRows } shape
+ * renderResults() expects, plus top-level `sql` and `data` properties
+ * recording the query that produced it and the loaded dataset's label -
+ * meant to be hosted and later loaded via the `result` URL parameter to
+ * preview a query's output before the engine boots (see handleResultFeed,
+ * which falls back to these when the `sql`/`data` URL parameters are absent).
+ */
+function downloadResultAsJson(idx) {
+  const res = currentResultSets[idx];
+  if (!res) return;
+  const json = JSON.stringify({ sql: currentResultSetsSql, data: currentLabel, ...res }, null, 2);
+  const filename = currentResultSets.length > 1 ? `query-result-${idx + 1}.json` : "query-result.json";
+  const blob = new Blob([json], { type: "application/json;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showToast(`Downloaded "${filename}"`, "success");
+}
+
 // ---- Table sidebar --------------------------------------------------------
 
 async function refreshTables() {
@@ -806,7 +1460,7 @@ async function refreshTables() {
       node.addEventListener("click", () => {
         const name = node.getAttribute("data-table");
         editor.setValue(`select * from "${name}" limit 100;`);
-        runQuery();
+        userRunQuery();
       });
     });
 
@@ -926,6 +1580,7 @@ function setResultsView(mode) {
   el.resultsBody.className = lastResultsClassName;
   el.resultsBody.innerHTML = lastResultsHtml;
   el.resultsMeta.textContent = lastResultsMeta;
+  markOverflowingCells();
 }
 
 /**
@@ -1049,7 +1704,7 @@ function loadHistoryQuery(id) {
   if (!entry || !editor) return;
   editor.setValue(entry.sql);
   editor.focus();
-  runQuery();
+  userRunQuery();
 }
 
 /**
@@ -1065,7 +1720,7 @@ function clearQueryHistory() {
  * Runs the first time the schema/ERD view is shown for a loaded database.
  */
 function firstBuildOfSchema() {
-  console.log("Showing schema for the first time");
+  //console.log("Showing schema for the first time");
 }
 
 /**
@@ -1100,8 +1755,8 @@ async function fetchErdSchema() {
     `select
        kcu.table_name as from_table,
        kcu.column_name as from_column,
-       ccu.table_name as to_table,
-       ccu.column_name as to_column,
+       kcu2.table_name as to_table,
+       kcu2.column_name as to_column,
        col.is_nullable
      from information_schema.table_constraints tc
      join information_schema.key_column_usage kcu
@@ -1110,9 +1765,10 @@ async function fetchErdSchema() {
      join information_schema.referential_constraints rc
        on tc.constraint_schema = rc.constraint_schema
       and tc.constraint_name = rc.constraint_name
-     join information_schema.constraint_column_usage ccu
-       on rc.unique_constraint_schema = ccu.constraint_schema
-      and rc.unique_constraint_name = ccu.constraint_name
+     join information_schema.key_column_usage kcu2
+       on rc.unique_constraint_schema = kcu2.constraint_schema
+      and rc.unique_constraint_name = kcu2.constraint_name
+      and kcu.position_in_unique_constraint = kcu2.ordinal_position
      join information_schema.columns col
        on col.table_schema = kcu.table_schema
       and col.table_name = kcu.table_name
@@ -1787,7 +2443,7 @@ function logErdTablePositions() {
   for (const [name, node] of erdState.nodes) {
     positions[name] = { x: node.x, y: node.y };
   }
-  console.log(JSON.stringify(positions, null, 2));
+  //console.log(JSON.stringify(positions, null, 2));
   return positions;
 }
 
@@ -2421,120 +3077,6 @@ async function handleUpload(file) {
   }
 }
 
-// ---- Load Data (submenu of fetchable, preset sources) ----------------------
-
-// Fetch one URL and normalize it to either a raw blob (direct file fetch) or
-// text pulled out of a Blogger feed JSON response. A JSON response is assumed
-// to be a blog post feed, and only its first post is used (single-entry
-// `entry`, or `feed.entry[0]` for a multi-entry/label feed). A post tagged
-// "binary" carries base64 content.
-async function fetchDataPiece(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
-
-  let data;
-  try {
-    data = await response.clone().json();
-  } catch (_) {
-    return { kind: "blob", blob: await response.blob() };
-  }
-
-  const post = data.entry || (data.feed && data.feed.entry && data.feed.entry[0]);
-  if (!post) return { kind: "text", text: "", isBinary: false };
-
-  const text = post.content && post.content.$t ? post.content.$t : "";
-  const labels = (post.category || []).map((c) => c.term);
-  return { kind: "text", text, isBinary: labels.includes("binary") };
-}
-
-function base64ToBytes(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-/**
- * Checks whether the current connection's public schema has no tables yet.
- */
-async function isDatabaseEmpty() {
-  if (!pg) return true;
-  const { rows } = await pg.query(
-    `select count(*)::int as count from information_schema.tables where table_schema = 'public';`
-  );
-  return rows[0]?.count === 0;
-}
-
-// Fetch every URL in `urls` in parallel, then assemble them in listed order
-// (positional, regardless of which fetch actually resolved first) and hand
-// the result to handleUpload() exactly as if it had been picked via "Upload DB".
-async function loadDataFromUrls(label, urls) {
-  // In shared mode another tab may have already loaded this data - avoid
-  // wiping and reloading it out from under them.
-  if (useSharedDb && !(await isDatabaseEmpty())) {
-    await maybeSetDatabaseReadOnly();
-    return;
-  }
-
-  setBusy(true);
-  setDataLoading(true, `Fetching "${label}"…`);
-  setStatus(`Fetching "${label}"…`);
-  try {
-    const resolvedPieces = await Promise.all(
-      urls.map((url, index) => fetchDataPiece(url).then((piece) => ({ index, piece })))
-    );
-    const pieces = resolvedPieces
-      .sort((a, b) => a.index - b.index)
-      .map((entry) => entry.piece);
-
-    let file;
-    if (pieces.every((p) => p.kind === "blob")) {
-      const blob = new Blob(pieces.map((p) => p.blob));
-      const filename = urls[0].split("/").pop() || label;
-      file = new File([blob], filename, { type: blob.type });
-    } else {
-      const combinedText = pieces.map((p) => (p.kind === "text" ? p.text : "")).join("");
-      const isBinary = pieces.some((p) => p.isBinary);
-      file = isBinary
-        ? new File([base64ToBytes(combinedText)], `${label}.tar.gz`)
-        : new File([combinedText], `${label}.sql`, { type: "text/plain" });
-    }
-    await wipeCurrentDatabaseStore();
-    await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
-    const uploaded = await handleUpload(file);
-    if (uploaded) runQuery();
-  } catch (err) {
-    console.error(err);
-    setStatus("Ready");
-    showToast(`Could not load "${label}": ${err.message}`, "error");
-  } finally {
-    setDataLoading(false);
-    setBusy(false);
-  }
-}
-
-// Register an entry in the "Load Data" submenu. `label` is the text shown to
-// the user; `url` is a relative path (or an array of them, fetched in
-// parallel and assembled in listed order) handed to handleUpload() exactly
-// as if that data had been picked via "Upload DB".
-function addLoadDataOption(label, url) {
-  const urls = Array.isArray(url) ? url : [url];
-
-  el.loadDataSection.hidden = false;
-  el.loadDataSeparator.hidden = false;
-
-  const btn = document.createElement("button");
-  btn.className = "menu-item";
-  btn.textContent = label;
-  btn.addEventListener("click", () => {
-    setMenuOpen(false);
-    loadDataFromUrls(label, urls);
-  });
-  el.loadDataSubmenu.appendChild(btn);
-  return btn;
-}
-window.addLoadDataOption = addLoadDataOption;
-
 function escapeCsvValue(value) {
   if (value === null || value === undefined) return "";
   const text = String(value);
@@ -2718,12 +3260,34 @@ function initResizer() {
 // ---- Wire up UI ------------------------------------------------------------
 
 function initEventListeners() {
-  el.run.addEventListener("click", () => runQuery());
+  el.splashRetry?.addEventListener("click", () => window.location.reload());
+
+  el.run.addEventListener("click", () => userRunQuery());
 
   el.resultsBody.addEventListener("click", (e) => {
+    const expandBtn = e.target.closest(".cell-expand-btn");
+    if (expandBtn) {
+      const td = expandBtn.closest("td");
+      const expanded = td.classList.toggle("cell-expanded");
+      expandBtn.title = expanded ? "Show less" : "Show full text";
+      return;
+    }
+
     const csvBtn = e.target.closest(".csv-btn");
     if (csvBtn) {
       downloadResultAsCsv(Number(csvBtn.getAttribute("data-idx")));
+      return;
+    }
+
+    const jsonBtn = e.target.closest(".result-json-btn");
+    if (jsonBtn) {
+      downloadResultAsJson(Number(jsonBtn.getAttribute("data-idx")));
+      return;
+    }
+
+    const pageBtn = e.target.closest(".page-btn");
+    if (pageBtn) {
+      goToResultPage(Number(pageBtn.getAttribute("data-idx")), pageBtn.getAttribute("data-dir"));
       return;
     }
 
@@ -2748,11 +3312,9 @@ function initEventListeners() {
     if (!el.menu.contains(e.target)) setMenuOpen(false);
   });
 
-  el.loadDataToggle.addEventListener("click", () => {
-    const isOpen = !el.loadDataSubmenu.hidden;
-    el.loadDataSubmenu.hidden = isOpen;
-    el.loadDataToggle.setAttribute("aria-expanded", String(!isOpen));
-    el.loadDataToggle.querySelector(".menu-caret").textContent = isOpen ? "▸" : "▾";
+  el.menuLoadData.addEventListener("click", () => {
+    setMenuOpen(false);
+    showDatasets();
   });
 
   el.menuUpload.addEventListener("click", () => {
@@ -2812,6 +3374,11 @@ function initEventListeners() {
     }
   });
 
+  el.menuAbout.addEventListener("click", () => {
+    setMenuOpen(false);
+    window.open("https://www.websql.org/2000/01/about.html", "_blank", "noopener");
+  });
+
   el.fileInput.addEventListener("change", async () => {
     const file = el.fileInput.files[0];
     el.fileInput.value = "";
@@ -2840,11 +3407,25 @@ function initEventListeners() {
 // ---- Boot -----------------------------------------------------------------
 
 async function main() {
+  scheduleSplashRetryReveal();
   initEventListeners();
   initResizer();
   await initMonaco();
+  if (useDeferredDb) {
+    hideSplash();
+    applySqlUrlParameter();
+    if (resultLabel) {
+      setStatus("Loading preview…");
+      loadResultFromBlog(resultLabel);
+    }
+    return;
+  }
   await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
+  hideSplash();
   applySqlUrlParameter();
+  if (isPrimaryInstance) {
+    applyDataUrlParameter();
+  }
 }
 
 // Resolves once the default database is ready. External code (e.g.

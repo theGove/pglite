@@ -13,6 +13,18 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <div id="splash" class="splash">
+    <div class="loading-dialog" role="alertdialog" aria-live="assertive" aria-busy="true">
+      <span class="spinner spinner-lg" aria-hidden="true"></span>
+      <div class="loading-dialog-text">
+        <div class="loading-dialog-title">Loading WebSQL Studio…</div>
+        <div class="loading-dialog-subtitle">Just a moment while the app starts up.</div>
+        <button id="splash-retry" class="btn btn-primary splash-retry-btn" type="button" hidden>Taking too long? Retry</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app-shell" style="display: none">
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark">▤</span>
@@ -45,15 +57,16 @@
           <button class="menu-item" id="menu-theme">
             <span class="icon" id="theme-icon">🌙</span> <span id="theme-label">Dark Mode</span>
           </button>
-          <div class="menu-separator" id="load-data-separator" hidden></div>
-          <div id="load-data-section" hidden>
-            <button class="menu-item" id="menu-load-data" aria-haspopup="true" aria-expanded="false">
-              <span class="icon">⇩</span> Load Data <span class="menu-caret">▸</span>
-            </button>
-            <div class="submenu" id="load-data-submenu" hidden></div>
-          </div>
+          <div class="menu-separator"></div>
+          <button class="menu-item" id="menu-load-data">
+            <span class="icon">⇩</span> webSQL Data
+          </button>
           <div class="menu-separator"></div>
           <button class="menu-item menu-item-danger" id="menu-clear">Clear Data</button>
+          <div class="menu-separator"></div>
+          <button class="menu-item" id="menu-about">
+            <span class="icon">ℹ</span> About webSQL.org
+          </button>
         </div>
       </div>
       <input id="file-input" type="file" accept=".tar,.tar.gz,.tgz,.sql,.csv,.xlsx,.xlsm,.xls" hidden />
@@ -124,6 +137,7 @@
     </span>
     <span id="db-name" class="db-name"></span>
   </footer>
+  </div>
 
   <div id="toast" class="toast" hidden></div>
 
