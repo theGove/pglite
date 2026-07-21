@@ -1,5 +1,5 @@
 // ---- Config -----------------------------------------------------------
-
+// 2026-07-21
 const MONACO_VERSION = "0.52.2";
 const PGLITE_VERSION = "0.5.4";
 const PGLITE_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/index.js`;
