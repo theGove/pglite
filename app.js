@@ -32,6 +32,17 @@ const DB_READY_TIMEOUT_MS = 10000;
 const SPLASH_RETRY_REVEAL_MS = 10000;
 
 
+// admin menu system for doing things at the command prompt
+function menu(){
+    console.log("\n\n\n")
+    console.log("Admin Menu:")
+    console.log("  a. Print ERD Table Positions")
+}
+function a(){
+  logErdTablePositions()
+}
+
+
 
 //for getting data from websqldata.blogspot.com
 let scriptFragments=null
@@ -2440,12 +2451,20 @@ function moveErdNode(tableName, x, y) {
 function logErdTablePositions() {
   if (!erdState) return null;
   const positions = {};
+  const stmt=[]
   for (const [name, node] of erdState.nodes) {
     positions[name] = { x: node.x, y: node.y };
   }
-  //console.log(JSON.stringify(positions, null, 2));
+  stmt.push("create schema system;")
+  stmt.push("create table system.erd(data text);")
+  stmt.push("insert into system.erd values('")
+  stmt.push(JSON.stringify(positions, null, 2))
+  stmt.push("');")
+  ;console.log(stmt.join("\n"));
   return positions;
 }
+
+
 
 /**
  * Merges an object shaped like `{ [tableName]: { x, y } }` (as produced by
