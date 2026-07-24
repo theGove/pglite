@@ -12,6 +12,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import rjsmin
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -88,14 +90,21 @@ def main():
         "app": (ROOT / "app.js").read_text(encoding="utf-8"),
         "css": (ROOT / "styles.css").read_text(encoding="utf-8"),
         "html": (ROOT / "index.html").read_text(encoding="utf-8"),
+        "embed": (ROOT / "embed.js").read_text(encoding="utf-8"),
     }
 
+    # pull the body from html
     body_match = re.search(r"<body[^>]*>(.*)</body>", content["html"], re.DOTALL | re.IGNORECASE)
     if not body_match:
         raise ValueError("Could not find <body>...</body> in index.html")
     content["html"] = body_match.group(1).strip()
+
+    # minify the js
+    content["app"] = rjsmin.jsmin(content["app"])
+    content["embed"] = rjsmin.jsmin(content["embed"])
+
     print("\n\n")
-    for label in ['app','css','html']:
+    for label in ['app','css','html','embed']:
         # print(label)
         feed = fetch_posts_by_label(sys.argv[1],label)
         if blog_id is None:
@@ -111,7 +120,7 @@ def main():
             sys.stdout.write(f"\nUpdating {label} . . .")
             post_id =  entries[0]["id"]["$t"].split("post-")[1]
             update_post(blog_id, post_id, content[label])
-            sys.stdout.write(" done.")
+            sys.stdout.write(" done.\n")
 
     print("\n\n")
 

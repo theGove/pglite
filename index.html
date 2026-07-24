@@ -35,6 +35,9 @@
       <div class="menu" id="menu">
         <button id="btn-menu" class="btn icon-btn-lg" title="Database actions" aria-haspopup="true" aria-expanded="false">☰</button>
         <div id="menu-panel" class="menu-panel" hidden>
+          <button class="menu-item" id="menu-schema-ai">
+            <span class="icon">📋</span> Get Schema for AI
+          </button>
           <button class="menu-item" id="menu-upload">
             <span class="icon">⭱</span> Upload Data(base)
           </button>
@@ -85,6 +88,12 @@
       <div id="table-list" class="table-list">
         <div class="empty-hint">No tables yet</div>
       </div>
+      <div class="sidebar-header saved-queries-header">
+        <span class="sidebar-title">Saved Queries</span>
+      </div>
+      <div id="saved-queries-list" class="table-list saved-queries-list">
+        <div class="empty-hint">No saved queries</div>
+      </div>
     </aside>
 
     <section class="workspace">
@@ -101,6 +110,15 @@
           </div>
           <span id="results-meta" class="results-meta"></span>
           <div id="erd-toolbar" class="erd-toolbar" hidden>
+            <select id="erd-mode-select" class="erd-select" title="ERD interaction mode" aria-label="ERD interaction mode">
+              <option value="sql">Write SQL</option>
+              <option value="edit">Edit Diagram</option>
+            </select>
+            <select id="erd-clause-select" class="erd-select" title="SQL clause to build" aria-label="SQL clause to build">
+              <option value="select">Select</option>
+              <option value="where">Where</option>
+              <option value="orderby">Order By</option>
+            </select>
             <button id="btn-erd-zoom-out" class="icon-btn" title="Zoom out" aria-label="ERD zoom out">−</button>
             <span id="erd-zoom-label" class="erd-zoom-label">100%</span>
             <button id="btn-erd-zoom-in" class="icon-btn" title="Zoom in" aria-label="ERD zoom in">+</button>

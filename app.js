@@ -345,11 +345,32 @@ let monacoRef = null;
 let currentFileLabel = DEFAULT_DB_LABEL;
 let currentResultSets = [];
 let currentResultSetsSql = "";
+let savedQueriesCache = [];
+/**
+ * True once the current in-browser database has changes (edits, imports,
+ * saved queries) that only exist in memory/IndexedDB and haven't been
+ * captured by a full "Download" (see handleDownload). Drives the
+ * beforeunload warning so a refresh/close doesn't silently lose them.
+ */
+let hasUnsavedChanges = false;
+/**
+ * Tracks the most recently kicked-off refreshTables() call, which itself
+ * runs a saved-queries select as its last step. refreshTables() is normally
+ * fired without awaiting it so the UI doesn't stall after a query run, but
+ * anything that needs the database to be quiescent first (e.g. handleSaveQuery's
+ * existence check) must await this or risk racing an overlapping query on the
+ * same PGlite connection.
+ */
+let pendingTablesRefresh = Promise.resolve();
 let columnsCache = new Map();
 let dataLoadingDepth = 0;
 let unsubLeaderChange = null;
 /** @type {'results' | 'erd' | 'history'} */
 let resultsViewMode = "results";
+/** @type {'edit' | 'sql'} Whether the ERD lets the user drag tables around or is in the (WIP) SQL-writing mode. */
+let erdMode = "sql";
+/** @type {'select' | 'where' | 'orderby'} Which clause a column click in Write SQL mode builds. */
+let erdClause = "select";
 let erdZoom = 1;
 /** @type {Map<string, { x: number, y: number }>} User-dragged ERD positions only. */
 let erdPositions = new Map();
@@ -384,6 +405,7 @@ const el = {
   //menuImportGist: document.getElementById("menu-import-gist"),
   //menuSaveGist: document.getElementById("menu-save-gist"),
   menuExportExcel: document.getElementById("menu-export-excel"),
+  menuSchemaAi: document.getElementById("menu-schema-ai"),
   menuOpenNewTab: document.getElementById("menu-open-new-tab"),
   menuTheme: document.getElementById("menu-theme"),
   themeIcon: document.getElementById("theme-icon"),
@@ -396,12 +418,15 @@ const el = {
   toggleSidebar: document.getElementById("btn-toggle-sidebar"),
   sidebar: document.getElementById("sidebar"),
   tableList: document.getElementById("table-list"),
+  savedQueriesList: document.getElementById("saved-queries-list"),
   resultsBody: document.getElementById("results-body"),
   resultsMeta: document.getElementById("results-meta"),
   viewResults: document.getElementById("btn-view-results"),
   viewHistory: document.getElementById("btn-view-history"),
   viewErd: document.getElementById("btn-view-erd"),
   erdToolbar: document.getElementById("erd-toolbar"),
+  erdModeSelect: document.getElementById("erd-mode-select"),
+  erdClauseSelect: document.getElementById("erd-clause-select"),
   erdZoomIn: document.getElementById("btn-erd-zoom-in"),
   erdZoomOut: document.getElementById("btn-erd-zoom-out"),
   erdZoomLabel: document.getElementById("erd-zoom-label"),
@@ -422,7 +447,7 @@ const el = {
   splashRetry: document.getElementById("splash-retry"),
   appShell: document.getElementById("app-shell"),
 };
-
+console.log("websql code is running")
 applyTheme(getPreferredTheme());
 setStatusBarVisible(false);
 el.erdLogPositions.hidden = !isAdminMode;
@@ -484,6 +509,123 @@ function showToast(message, kind) {
   showToast._t = setTimeout(() => {
     el.toast.hidden = true;
   }, 3200);
+}
+
+// ---- Styled dialogs (replace native confirm()/prompt()) --------------------
+
+/**
+ * Builds the overlay + dialog shell shared by `showConfirmDialog` and
+ * `showPromptDialog`, styled to match the rest of the app instead of the
+ * browser's native dialog boxes.
+ * @param {string} title
+ * @returns {{ overlay: HTMLElement, dialog: HTMLElement }}
+ */
+function createAppDialogShell(title) {
+  const overlay = document.createElement("div");
+  overlay.className = "loading-overlay app-dialog-overlay";
+
+  const dialog = document.createElement("div");
+  dialog.className = "loading-dialog app-dialog";
+  dialog.innerHTML = `<div class="app-dialog-header loading-dialog-title">${escapeHtml(title)}</div>`;
+
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  return { overlay, dialog };
+}
+
+/**
+ * Styled replacement for the browser's native `confirm()`.
+ * @param {string} message
+ * @param {{ confirmLabel?: string, cancelLabel?: string, danger?: boolean }} [opts]
+ * @returns {Promise<boolean>} Whether the user confirmed.
+ */
+function showConfirmDialog(message, opts = {}) {
+  const { confirmLabel = "OK", cancelLabel = "Cancel", danger = false } = opts;
+  return new Promise((resolve) => {
+    const { overlay, dialog } = createAppDialogShell(message);
+    dialog.insertAdjacentHTML(
+      "beforeend",
+      `<div class="app-dialog-actions">
+         <button type="button" class="btn app-dialog-cancel">${escapeHtml(cancelLabel)}</button>
+         <button type="button" class="btn ${danger ? "btn-danger" : "btn-primary"} app-dialog-confirm">${escapeHtml(confirmLabel)}</button>
+       </div>`
+    );
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeydown);
+      overlay.remove();
+      resolve(result);
+    };
+    const onKeydown = (e) => {
+      if (e.repeat) return;
+      if (e.key !== "Escape" && e.key !== "Enter") return;
+      e.preventDefault();
+      finish(e.key === "Enter");
+    };
+
+    dialog.querySelector(".app-dialog-cancel").addEventListener("click", () => finish(false));
+    dialog.querySelector(".app-dialog-confirm").addEventListener("click", () => finish(true));
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) finish(false);
+    });
+    document.addEventListener("keydown", onKeydown);
+    dialog.querySelector(".app-dialog-confirm").focus();
+  });
+}
+
+/**
+ * Styled replacement for the browser's native `prompt()`.
+ * @param {string} message
+ * @param {{ placeholder?: string, defaultValue?: string, confirmLabel?: string, cancelLabel?: string }} [opts]
+ * @returns {Promise<string | null>} The entered value, or null if cancelled.
+ */
+function showPromptDialog(message, opts = {}) {
+  const { placeholder = "", defaultValue = "", confirmLabel = "OK", cancelLabel = "Cancel" } = opts;
+  return new Promise((resolve) => {
+    const { overlay, dialog } = createAppDialogShell(message);
+    dialog.insertAdjacentHTML(
+      "beforeend",
+      `<div class="app-dialog-body">
+         <input type="text" class="app-dialog-input" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(defaultValue)}" />
+       </div>
+       <div class="app-dialog-actions">
+         <button type="button" class="btn app-dialog-cancel">${escapeHtml(cancelLabel)}</button>
+         <button type="button" class="btn btn-primary app-dialog-confirm">${escapeHtml(confirmLabel)}</button>
+       </div>`
+    );
+
+    const input = dialog.querySelector(".app-dialog-input");
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeydown);
+      overlay.remove();
+      resolve(result);
+    };
+    const onKeydown = (e) => {
+      if (e.repeat) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finish(null);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        finish(input.value);
+      }
+    };
+
+    dialog.querySelector(".app-dialog-cancel").addEventListener("click", () => finish(null));
+    dialog.querySelector(".app-dialog-confirm").addEventListener("click", () => finish(input.value));
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) finish(null);
+    });
+    document.addEventListener("keydown", onKeydown);
+    input.focus();
+    input.select();
+  });
 }
 
 /**
@@ -655,6 +797,10 @@ async function applyDataUrlParameter() {
 /** Schema used for this app's own bookkeeping tables, kept out of the public schema so it never shows up in the table list/ERD or collides with a dataset's own tables. */
 const APP_META_SCHEMA = "_websql_studio";
 const LOADED_DATASET_TABLE = `${APP_META_SCHEMA}.loaded_dataset`;
+
+/** Schema + table where user-named "Save Query" snippets are stored. */
+const SAVED_QUERIES_SCHEMA = "system";
+const SAVED_QUERIES_TABLE = `${SAVED_QUERIES_SCHEMA}.saved_query`;
 
 /**
  * Reads the blog dataset label recorded on the currently-attached database
@@ -957,7 +1103,7 @@ function bindLeaderChange(instance) {
   }
   if (!useSharedDb || !instance || typeof instance.onLeaderChange !== "function") return;
   unsubLeaderChange = instance.onLeaderChange(() => {
-    refreshTables().catch(() => {});
+    pendingTablesRefresh = refreshTables().catch(() => {});
   });
 }
 
@@ -996,6 +1142,7 @@ async function switchDatabase(factory, label, { showLoadingOverlay = true, overl
     setStatus("Ready");
     await refreshTables();
     clearResults("Run a query to see results here.");
+    clearUnsavedChanges();
   } catch (err) {
     console.error(err);
     setStatus("Failed to load database");
@@ -1027,20 +1174,14 @@ async function importIntoCurrentDatabase(file) {
     if (kind === "sql") {
       const text = await file.text();
       await pg.exec(text);
-      return;
-    }
-
-    if (kind === "csv") {
+    } else if (kind === "csv") {
       await importCsvIntoDatabase(pg, file);
-      return;
-    }
-
-    if (kind === "excel") {
+    } else if (kind === "excel") {
       await importExcelIntoDatabase(pg, file);
-      return;
+    } else {
+      throw new Error("Unsupported file type. Use .sql, .csv or Excel.");
     }
-
-    throw new Error("Unsupported file type. Use .sql, .csv or Excel.");
+    markUnsavedChanges();
   } finally {
     setDataLoading(false);
   }
@@ -1050,6 +1191,26 @@ async function importIntoCurrentDatabase(file) {
 
 function isMetaCommand(text) {
   return typeof text === "string" && text.trim().startsWith("\\");
+}
+
+/** Matches the leading keyword of statements that only read data. */
+const READ_ONLY_SQL_RE = /^\s*(select|with|explain|show|table)\b/i;
+
+/** Heuristic: every semicolon-separated statement in `sql` looks read-only. */
+function sqlLooksReadOnly(sql) {
+  return sql
+    .split(";")
+    .map((stmt) => stmt.trim())
+    .filter(Boolean)
+    .every((stmt) => READ_ONLY_SQL_RE.test(stmt));
+}
+
+function markUnsavedChanges() {
+  hasUnsavedChanges = true;
+}
+
+function clearUnsavedChanges() {
+  hasUnsavedChanges = false;
 }
 
 function normalizeMetaObjectName(value) {
@@ -1213,15 +1374,15 @@ async function runQuery() {
   setStatus("Running…");
   const startedAt = performance.now();
   try {
-    const results = isMetaCommand(sql)
-      ? await runMetaCommand(sql)
-      : await pg.exec(sql);
+    const isMeta = isMetaCommand(sql);
+    const results = isMeta ? await runMetaCommand(sql) : await pg.exec(sql);
+    if (!isMeta && !sqlLooksReadOnly(sql)) markUnsavedChanges();
     const elapsed = Math.round(performance.now() - startedAt);
     addQueryHistoryEntry({ sql, ok: true, elapsedMs: elapsed });
     currentResultSetsSql = sql;
     renderResults(results, elapsed);
     setStatus("Ready");
-    refreshTables();
+    pendingTablesRefresh = refreshTables();
   } catch (err) {
     console.error(err);
     addQueryHistoryEntry({ sql, ok: false, error: err.message || String(err) });
@@ -1261,9 +1422,8 @@ function buildResultBlockHtml(res, i) {
   const jsonBtn = hasRows && isAdminMode
     ? `<button class="result-json-btn" data-idx="${i}" title="Download the raw pg.exec() result as JSON, for hosting as a canned preview">⭳ JSON</button>`
     : "";
-  const actions = csvBtn || jsonBtn
-    ? `<div class="result-block-actions">${csvBtn}${jsonBtn}</div>`
-    : "";
+  const saveQueryBtn = `<button class="save-query-btn" title="Save this query">⭳ Save Query</button>`;
+  const actions = `<div class="result-block-actions">${csvBtn}${jsonBtn}${saveQueryBtn}</div>`;
   const header = labelText || actions
     ? `<div class="result-block-label"><span>${labelText}</span>${actions}</div>`
     : "";
@@ -1346,6 +1506,9 @@ function renderTable(res, rows, rowOffset) {
           const v = row[c];
           if (v === null || v === undefined) return `<td class="cell-null">null</td>`;
           const text = v instanceof Date ? formatDateValue(v) : typeof v === "object" ? JSON.stringify(v) : String(v);
+          if (c.toLowerCase().endsWith("_html")) {
+            return `<td class="cell-truncatable cell-html"><span class="cell-text">${text}</span></td>`;
+          }
           const cellClass = isNumericValue(v) ? "cell-numeric" : "";
           return `<td class="cell-truncatable ${cellClass}"><span class="cell-text">${escapeHtml(text)}</span></td>`;
         })
@@ -1445,45 +1608,149 @@ async function refreshTables() {
   columnsCache.clear();
   try {
     const { rows } = await pg.query(
-      `select table_name from information_schema.tables
-       where table_schema = 'public' order by table_name;`
+      `select table_name, table_type from information_schema.tables
+       where table_schema = 'public' order by (table_type = 'VIEW'), table_name;`
     );
     if (!rows.length) {
       el.tableList.innerHTML = `<div class="empty-hint">No tables yet</div>`;
-      return;
-    }
-    el.tableList.innerHTML = rows
-      .map(
-        (r) => `
-        <div class="table-group">
-          <div class="table-row">
-            <button class="table-toggle" data-table="${escapeHtml(r.table_name)}" aria-label="Toggle columns">▸</button>
-            <span class="table-name" data-table="${escapeHtml(r.table_name)}">
-              <span class="table-icon">▦</span>${escapeHtml(r.table_name)}
-            </span>
-          </div>
-          <div class="table-columns" hidden></div>
-        </div>`
-      )
-      .join("");
+    } else {
+      el.tableList.innerHTML = rows
+        .map((r) => {
+          const isView = r.table_type === "VIEW";
+          return `
+          <div class="table-group">
+            <div class="table-row">
+              <button class="table-toggle" data-table="${escapeHtml(r.table_name)}" aria-label="Toggle columns">▸</button>
+              <span class="table-name${isView ? " is-view" : ""}" data-table="${escapeHtml(r.table_name)}">
+                <span class="table-icon">▦</span>${escapeHtml(r.table_name)}
+              </span>
+            </div>
+            <div class="table-columns" hidden></div>
+          </div>`;
+        })
+        .join("");
 
-    el.tableList.querySelectorAll(".table-name").forEach((node) => {
-      node.addEventListener("click", () => {
-        const name = node.getAttribute("data-table");
-        editor.setValue(`select * from "${name}" limit 100;`);
-        userRunQuery();
+      el.tableList.querySelectorAll(".table-name").forEach((node) => {
+        node.addEventListener("click", () => {
+          const name = node.getAttribute("data-table");
+          editor.setValue(`select * from "${name}" limit 100;`);
+          userRunQuery();
+        });
       });
-    });
 
-    el.tableList.querySelectorAll(".table-toggle").forEach((btn) => {
-      btn.addEventListener("click", () => toggleTableColumns(btn));
-    });
+      el.tableList.querySelectorAll(".table-toggle").forEach((btn) => {
+        btn.addEventListener("click", () => toggleTableColumns(btn));
+      });
+    }
 
     if (resultsViewMode === "erd") {
       renderErd({ rebuild: true }).catch(console.error);
     }
   } catch (err) {
     console.error(err);
+  }
+  await refreshSavedQueries();
+}
+
+/**
+ * Loads the user's named "Save Query" snippets from `system.saved_queries`
+ * (created lazily the first time a query is saved) and renders them below
+ * the table list. Missing schema/table just means none have been saved yet.
+ */
+async function refreshSavedQueries() {
+  if (!pg) return;
+  try {
+    const { rows } = await pg.query(`select name, sql from ${SAVED_QUERIES_TABLE} order by name;`);
+    savedQueriesCache = rows;
+  } catch (_) {
+    savedQueriesCache = [];
+  }
+
+  if (!savedQueriesCache.length) {
+    el.savedQueriesList.innerHTML = `<div class="empty-hint">No saved queries</div>`;
+    return;
+  }
+
+  el.savedQueriesList.innerHTML = savedQueriesCache
+    .map(
+      (q, i) => `
+      <div class="table-row saved-query-row">
+        <span class="table-name saved-query-name" data-idx="${i}" title="${escapeHtml(q.sql)}">
+          <span class="table-icon">🔖</span>${escapeHtml(q.name)}
+        </span>
+        <button type="button" class="table-toggle saved-query-delete-btn" data-idx="${i}" title="Delete saved query">🗑️</button>
+      </div>`
+    )
+    .join("");
+
+  el.savedQueriesList.querySelectorAll(".saved-query-name").forEach((node) => {
+    node.addEventListener("click", () => {
+      const query = savedQueriesCache[Number(node.getAttribute("data-idx"))];
+      if (!query) return;
+      editor.setValue(query.sql);
+      runQuery();
+    });
+  });
+
+  el.savedQueriesList.querySelectorAll(".saved-query-delete-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const query = savedQueriesCache[Number(btn.getAttribute("data-idx"))];
+      if (!query) return;
+      if (!(await showConfirmDialog(`Delete saved query "${query.name}"?`, { confirmLabel: "Delete", danger: true }))) return;
+      try {
+        await pg.query(`delete from ${SAVED_QUERIES_TABLE} where name = $1;`, [query.name]);
+        showToast(`Deleted query "${query.name}"`, "success");
+        await refreshSavedQueries();
+      } catch (err) {
+        console.error(err);
+        showToast(err.message || "Failed to delete query", "error");
+      }
+    });
+  });
+}
+
+/**
+ * Prompts for a name and records the SQL currently in the editor into
+ * `system.saved_queries`, creating the `system` schema/table on first use.
+ */
+async function handleSaveQuery() {
+  if (!pg) return;
+  const sql = editor.getValue().trim();
+  if (!sql) return;
+
+  // Let any in-flight background refresh (kicked off by the last query run)
+  // finish first, so its saved-queries select can't race the calls below.
+  await pendingTablesRefresh;
+
+  const name = await showPromptDialog("Save query as:");
+  if (!name) return;
+
+  try {
+    await pg.exec(
+      `create schema if not exists ${SAVED_QUERIES_SCHEMA};
+       create table if not exists ${SAVED_QUERIES_TABLE} (name text primary key, sql text not null);`
+    );
+
+    const { rows: existingRows } = await pg.query(`select 1 from ${SAVED_QUERIES_TABLE} where name = $1;`, [name]);
+    if (
+      existingRows.length &&
+      !(await showConfirmDialog(`A saved query named "${name}" already exists. Replace it?`, { confirmLabel: "Replace" }))
+    ) {
+      return;
+    }
+
+    await pg.query(
+      `insert into ${SAVED_QUERIES_TABLE} (name, sql) values ($1, $2)
+       on conflict (name) do update set sql = excluded.sql;`,
+      [name, sql]
+    );
+    markUnsavedChanges();
+    showToast(`Saved query "${name}"`, "success");
+    await refreshSavedQueries();
+  } catch (err) {
+    console.error(err);
+    showToast(err.message || "Failed to save query", "error");
   }
 }
 
@@ -2263,7 +2530,8 @@ function renderErdNode(node) {
             col.isPk || col.isFk
               ? erdKeyIcon(node.width - 44, y + 6, col.isPk)
               : "";
-          return `<g class="${classes.join(" ")}">
+          return `<g class="${classes.join(" ")}" data-column="${escapeHtml(col.name)}">
+            <rect class="erd-column-hit" x="0" y="${y}" width="${node.width}" height="${ERD_ROW_HEIGHT}"></rect>
             <text x="16" y="${textY}" class="erd-column-text">${escapeHtml(col.name)}<tspan class="erd-column-type"> - ${escapeHtml(col.type)}</tspan></text>
             ${key}
           </g>`;
@@ -2404,6 +2672,13 @@ function bindErdRelationshipHandlers() {
       const index = Number(relEl.getAttribute("data-rel-index"));
       if (!Number.isFinite(index)) return;
       selectErdRelationship(erdSelectedRelIndex === index ? null : index);
+      if (erdMode === "sql") {
+        const rel = erdState?.relationships?.[index];
+        if (rel) {
+          const fragment = `${rel.fromTable} JOIN ${rel.toTable} ON ${rel.fromTable}.${rel.fromColumn} = ${rel.toTable}.${rel.toColumn}`;
+          erdAmendSql(fragment, "link", event.ctrlKey);
+        }
+      }
       event.stopPropagation();
       return;
     }
@@ -2526,6 +2801,240 @@ async function fetchErdPositionsFromDb() {
 }
 window.applyErdTablePositions = applyErdTablePositions;
 
+// ---- ERD "Write SQL" query builder -----------------------------------------
+//
+// Clicking a table, column, or relationship in Write SQL mode builds up a
+// SELECT statement in the main SQL editor. While the editor still holds
+// exactly what this builder last generated, clicks grow the statement (add a
+// table, add a column, add a join). As soon as the user edits the SQL by
+// hand, clicks fall back to inserting the clicked name as text at the cursor
+// instead, so the builder never clobbers a query someone is writing.
+
+/** ERD-formatted column types (see `formatErdType`) that shouldn't be quoted in generated WHERE clauses. */
+const ERD_NUMERIC_TYPES = new Set(["INT", "BIGINT", "SMALLINT", "NUMERIC", "REAL", "FLOAT8"]);
+
+/** @type {{ select: string[], from: string[], tables: string[], where: Array<{ column: string, value: string, numeric: boolean }>, orderBy: string[] }} */
+let erdQuery = { select: [], from: [], tables: [], where: [], orderBy: [] };
+/** @type {string[]} JSON-stringified snapshots of `erdQuery`, oldest first. */
+let erdQueryHistory = [];
+let erdQueryHistoryPosition = 0;
+
+/**
+ * Drops the table prefix from a `table.column` string when there's only one
+ * table in the query (so it doesn't need qualifying to stay unambiguous).
+ * @param {string} entry
+ */
+function erdQualifyForRender(entry) {
+  if (entry.indexOf(".") === -1) return entry;
+  return erdQuery.tables.length === 1 ? entry.split(".")[1] : entry;
+}
+
+/**
+ * Renders `erdQuery` as a SQL statement.
+ * @returns {string}
+ */
+function erdGetLocalSql() {
+  let sql = "SELECT  ";
+  for (let x = 0; x < erdQuery.select.length; x++) {
+    if (x > 0) sql += "\n        ,";
+    sql += erdQualifyForRender(erdQuery.select[x]);
+  }
+  for (let x = 0; x < erdQuery.from.length; x++) {
+    sql += "\n";
+    if (x === 0) sql += "FROM    ";
+    sql += erdQuery.from[x];
+  }
+  if (erdQuery.where.length) {
+    sql +=
+      "\nWHERE   " +
+      erdQuery.where
+        .map((w) => `${erdQualifyForRender(w.column)} = ${w.numeric ? w.value : `'${w.value}'`}`)
+        .join("\n  AND   ");
+  }
+  if (erdQuery.orderBy.length) {
+    sql += "\nORDER BY " + erdQuery.orderBy.map(erdQualifyForRender).join(", ");
+  }
+  return sql.trim() === "SELECT" ? "" : sql;
+}
+
+/**
+ * Adds a table (`field === "*"`) or column to the select list in `erdQuery`.
+ * @param {string} table
+ * @param {string} field
+ * @returns {string | undefined} An error message, if the addition isn't valid.
+ */
+function erdAddField(table, field) {
+  if (erdQuery.select.indexOf(table + "." + field) > -1) return;
+
+  if (erdQuery.tables.length === 0) {
+    erdQuery.select.push(table + "." + field);
+    erdQuery.tables.push(table);
+    erdQuery.from.push(table);
+    return;
+  }
+  if (erdQuery.tables.indexOf(table) === -1) {
+    return `Cannot add table to query. Try clicking ON a link instead.`;
+  }
+  if (field === "*") {
+    return `Cannot add table to query. Try clicking ON a field instead.`;
+  }
+  if (erdQuery.select.length === 1 && erdQuery.select[0] === "*") {
+    erdQuery.select[0] = table + "." + field;
+    return;
+  }
+  if (erdQuery.select.length === 1 && erdQuery.select[0].endsWith(".*")) {
+    erdQuery.select.shift();
+  }
+  erdQuery.select.push(table + "." + field);
+}
+
+/**
+ * Adds a column to the ORDER BY clause in `erdQuery`.
+ * @param {string} table
+ * @param {string} field
+ * @returns {string | undefined} An error message, if the addition isn't valid.
+ */
+function erdAddOrderBy(table, field) {
+  if (erdQuery.tables.indexOf(table) === -1) {
+    return `Add "${table}" to the query before ordering by one of its columns.`;
+  }
+  const qualified = table + "." + field;
+  if (erdQuery.orderBy.indexOf(qualified) === -1) {
+    erdQuery.orderBy.push(qualified);
+  }
+}
+
+/**
+ * Prompts for a value and adds a `column = value` condition to the WHERE
+ * clause in `erdQuery`. Numeric columns get an unquoted value; everything
+ * else is quoted, with single quotes doubled so they're valid inside the
+ * SQL string literal.
+ * @param {string} table
+ * @param {string} field
+ * @returns {string | undefined} An error message, if the addition isn't valid.
+ */
+async function erdAddWhere(table, field) {
+  if (erdQuery.tables.indexOf(table) === -1) {
+    return `Add "${table}" to the query before filtering on one of its columns.`;
+  }
+  const raw = await showPromptDialog(`Value for ${table}.${field} =`);
+  if (raw === null) return;
+  const column = erdState?.nodes.get(table)?.columns.find((c) => c.name === field);
+  const numeric = !!column && ERD_NUMERIC_TYPES.has(column.type);
+  erdQuery.where.push({
+    column: table + "." + field,
+    value: numeric ? raw.trim() : raw.replace(/'/g, "''"),
+    numeric,
+  });
+}
+
+/** Writes the current `erdQuery` into the SQL editor. */
+function erdWriteQuery() {
+  if (editor) editor.setValue(erdGetLocalSql());
+}
+
+/**
+ * Handles a click on a table, column, or relationship in ERD Write SQL mode.
+ * @param {string} fragment - `table`, `table.column`, or `table1 JOIN table2 ON table1.col = table2.col`.
+ * @param {'table' | 'field' | 'link'} kind
+ * @param {boolean} ctrlKey
+ */
+async function erdAmendSql(fragment, kind, ctrlKey) {
+  if (!editor) return;
+
+  const current = editor.getValue();
+  if (current.trim().length === 0) {
+    erdQuery = { select: [], from: [], tables: [], where: [], orderBy: [] };
+    erdQueryHistory = [];
+    erdQueryHistoryPosition = 0;
+  }
+
+  if (current.trim() !== erdGetLocalSql()) {
+    // The editor has diverged from what we last built, so just insert the
+    // clicked atom as text at the cursor, like the user typed it themselves.
+    let insert = fragment;
+    if (kind === "table") {
+      if (!ctrlKey) {
+        const parts = insert.split(".");
+        insert = parts[parts.length - 1];
+      }
+      insert = ", " + insert;
+    } else if (kind === "field" && ctrlKey) {
+      insert = ", " + insert;
+    }
+    editor.trigger("erd", "type", { text: insert });
+    editor.focus();
+    return;
+  }
+
+  let msg;
+  if (fragment.indexOf(".") === -1) {
+    msg = erdAddField(fragment, "*");
+  } else if (fragment.indexOf(" JOIN ") === -1) {
+    const table = fragment.split(".")[0];
+    const field = fragment.split(".")[1];
+    if (erdClause === "orderby") {
+      msg = erdAddOrderBy(table, field);
+    } else if (erdClause === "where") {
+      msg = await erdAddWhere(table, field);
+    } else {
+      msg = erdAddField(table, field);
+    }
+  } else {
+    const temp = fragment.replace(" JOIN ", " ").split(" ");
+    const table1 = temp[0];
+    const table2 = temp[1];
+
+    if (erdQuery.tables.length === 0) {
+      msg = erdAddField(table1, "*");
+      if (!msg) {
+        const onClause = fragment.split(" ON ")[1];
+        erdQuery.from.push("  JOIN  " + table2 + "\n    ON  " + onClause);
+        erdQuery.tables.push(table2);
+      }
+    } else {
+      let matchCount = 0;
+      let tableToAdd;
+      for (const tname of erdQuery.tables) {
+        if (tname === table1) {
+          matchCount++;
+          tableToAdd = table2;
+        }
+        if (tname === table2) {
+          matchCount++;
+          tableToAdd = table1;
+        }
+      }
+      if (matchCount === 0) {
+        msg = `Neither "${table1}" nor "${table2}" is already in the query, so we cannot add the selected join.`;
+      } else if (matchCount === 1) {
+        erdQuery.from.push(
+          "  JOIN  " + tableToAdd + "\n    ON  " + fragment.split(" ON ")[1].replace(/ AND /g, "\n    AND ")
+        );
+        erdQuery.tables.push(tableToAdd);
+      } else {
+        msg = `Both "${table1}" and "${table2}" are already in the query, so we cannot add the selected join.`;
+      }
+    }
+  }
+
+  if (msg) {
+    showToast(msg, "error");
+    return;
+  }
+
+  if (erdQueryHistoryPosition < erdQueryHistory.length - 1) {
+    erdQueryHistory.splice(erdQueryHistoryPosition + 1);
+  }
+  const snapshot = JSON.stringify(erdQuery);
+  if (snapshot !== erdQueryHistory[erdQueryHistory.length - 1]) {
+    erdQueryHistory.push(snapshot);
+    erdQueryHistoryPosition = erdQueryHistory.length - 1;
+  }
+
+  erdWriteQuery();
+}
+
 /**
  * Starts dragging an ERD table card.
  * @param {PointerEvent} event
@@ -2577,13 +3086,28 @@ function endErdDrag(event) {
 }
 
 /**
- * Attaches pointer listeners so ERD table cards can be dragged.
+ * Attaches pointer listeners so ERD table cards can be dragged (Edit Diagram
+ * mode), or a click listener that feeds the clicked table/column into the
+ * SQL builder (Write SQL mode, which doesn't allow rearranging tables).
  */
 function bindErdDragHandlers() {
   const svg = el.resultsBody.querySelector(".erd-svg");
   if (!svg) return;
 
   svg.querySelectorAll(".erd-node").forEach((nodeEl) => {
+    if (erdMode === "sql") {
+      nodeEl.addEventListener("click", (event) => {
+        const tableName = nodeEl.getAttribute("data-table");
+        if (!tableName) return;
+        const columnName = event.target.closest(".erd-column-row")?.getAttribute("data-column");
+        if (columnName) {
+          erdAmendSql(`${tableName}.${columnName}`, "field", event.ctrlKey);
+        } else {
+          erdAmendSql(tableName, "table", event.ctrlKey);
+        }
+      });
+      return;
+    }
     nodeEl.addEventListener("pointerdown", (event) => startErdDrag(event, nodeEl));
     nodeEl.addEventListener("pointermove", onErdPointerMove);
     nodeEl.addEventListener("pointerup", endErdDrag);
@@ -2829,7 +3353,7 @@ function renderErdView() {
   const nodesSvg = [...nodes.values()].map((node) => renderErdNode(node)).join("");
 
   el.resultsBody.innerHTML = `
-    <div class="erd-scroll">
+    <div class="erd-scroll${erdMode === "sql" ? " is-sql-mode" : ""}">
       <svg class="erd-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
            role="group" aria-label="Interactive entity relationship diagram"
            style="width: ${width}px; height: ${height}px; transform: scale(${erdZoom});">
@@ -3053,6 +3577,7 @@ async function importGistCsvs(gistId) {
       await importCsvTextIntoDatabase(pg, text, filename.replace(/\.csv$/i, ""));
     }
 
+    markUnsavedChanges();
     await refreshTables();
     clearResults("Run a query to see results here.");
     await maybeSetDatabaseReadOnly();
@@ -3118,10 +3643,10 @@ function rowsToCsv(rows, fields) {
 async function handleSaveToGist() {
   if (!pg) return;
 
-  const token = prompt("Enter your GitHub personal access token:");
+  const token = await showPromptDialog("Enter your GitHub personal access token:");
   if (!token) return;
 
-  const description = prompt("Optional gist description:") || "PGlite Studio export";
+  const description = (await showPromptDialog("Optional gist description:")) || "PGlite Studio export";
   setBusy(true);
   setStatus("Saving tables to gist…");
   try {
@@ -3193,11 +3718,133 @@ async function handleDownload() {
     a.remove();
     URL.revokeObjectURL(url);
     setStatus("Ready");
+    clearUnsavedChanges();
     showToast(`Downloaded "${filename}"`, "success");
   } catch (err) {
     console.error(err);
     showToast("Download failed: " + err.message, "error");
     setStatus("Ready");
+  } finally {
+    setBusy(false);
+  }
+}
+
+/**
+ * Builds a schema-only SQL dump (tables, constraints, indexes, views) for the
+ * public schema, reading pg_catalog directly so column types/defaults match
+ * exactly what Postgres would report.
+ */
+async function generateSchemaSql() {
+  const { rows: tableRows } = await pg.query(
+    `select c.relname as table_name
+     from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'public' and c.relkind = 'r'
+     order by c.relname;`
+  );
+
+  if (!tableRows.length) {
+    throw new Error("There are no tables in this database.");
+  }
+
+  const { rows: columnRows } = await pg.query(
+    `select c.relname as table_name, a.attname as column_name,
+            format_type(a.atttypid, a.atttypmod) as data_type,
+            a.attnotnull as not_null,
+            pg_get_expr(ad.adbin, ad.adrelid) as default_expr
+     from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+     join pg_attribute a on a.attrelid = c.oid
+     left join pg_attrdef ad on ad.adrelid = a.attrelid and ad.adnum = a.attnum
+     where n.nspname = 'public' and c.relkind = 'r'
+       and a.attnum > 0 and not a.attisdropped
+     order by c.relname, a.attnum;`
+  );
+
+  const { rows: constraintRows } = await pg.query(
+    `select c.relname as table_name, con.conname, con.contype,
+            pg_get_constraintdef(con.oid) as def
+     from pg_constraint con
+     join pg_class c on c.oid = con.conrelid
+     join pg_namespace n on n.oid = c.relnamespace
+     where n.nspname = 'public'
+     order by c.relname,
+       case con.contype when 'p' then 1 when 'u' then 2 when 'f' then 3 else 4 end;`
+  );
+
+  const { rows: indexRows } = await pg.query(
+    `select tablename, indexname, indexdef
+     from pg_indexes
+     where schemaname = 'public'
+     order by tablename, indexname;`
+  );
+
+  const { rows: viewRows } = await pg.query(
+    `select viewname, definition
+     from pg_views
+     where schemaname = 'public'
+     order by viewname;`
+  );
+
+  const columnsByTable = new Map();
+  for (const row of columnRows) {
+    if (!columnsByTable.has(row.table_name)) columnsByTable.set(row.table_name, []);
+    columnsByTable.get(row.table_name).push(row);
+  }
+
+  const constraintsByTable = new Map();
+  const constraintNames = new Set();
+  for (const row of constraintRows) {
+    if (!constraintsByTable.has(row.table_name)) constraintsByTable.set(row.table_name, []);
+    constraintsByTable.get(row.table_name).push(row);
+    if (row.contype === "p" || row.contype === "u") constraintNames.add(row.conname);
+  }
+
+  const parts = [];
+
+  for (const { table_name } of tableRows) {
+    const columns = columnsByTable.get(table_name) || [];
+    const columnLines = columns.map((col) => {
+      let line = `  "${col.column_name}" ${col.data_type}`;
+      if (col.not_null) line += " NOT NULL";
+      if (col.default_expr) line += ` DEFAULT ${col.default_expr}`;
+      return line;
+    });
+    parts.push(`CREATE TABLE "${table_name}" (\n${columnLines.join(",\n")}\n);`);
+  }
+
+  for (const { table_name } of tableRows) {
+    for (const con of constraintsByTable.get(table_name) || []) {
+      parts.push(`ALTER TABLE "${table_name}" ADD CONSTRAINT "${con.conname}" ${con.def};`);
+    }
+  }
+
+  for (const idx of indexRows) {
+    if (constraintNames.has(idx.indexname)) continue;
+    parts.push(`${idx.indexdef};`);
+  }
+
+  for (const view of viewRows) {
+    parts.push(`CREATE VIEW "${view.viewname}" AS\n${view.definition.trim().replace(/;$/, "")};`);
+  }
+
+  return parts.join("\n\n") + "\n";
+}
+
+async function handleCopySchemaForAi() {
+  if (!pg) return;
+  setBusy(true);
+  setStatus("Building schema…");
+  try {
+    const sql = await generateSchemaSql();
+    const messageForAi = `Here's a schema script for a postgresql database I'm wroking with.\n\n${sql}\n\n I'm going to ask for help writing some quereries once you unstand the structure.  I'll ask the questions in natural language.  You produce the SQL to answer the question using the given schema.`;
+    await navigator.clipboard.writeText(messageForAi);
+    setStatus("Ready");
+    showToast("Schema copied to clipboard", "success");
+  } catch (err) {
+    console.error(err);
+    setStatus("Ready");
+    showToast("Could not copy schema: " + err.message, "error");
   } finally {
     setBusy(false);
   }
@@ -3279,11 +3926,17 @@ function initResizer() {
 // ---- Wire up UI ------------------------------------------------------------
 
 function initEventListeners() {
+  window.addEventListener("beforeunload", (e) => {
+    if (!hasUnsavedChanges) return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
+
   el.splashRetry?.addEventListener("click", () => window.location.reload());
 
   el.run.addEventListener("click", () => userRunQuery());
 
-  el.resultsBody.addEventListener("click", (e) => {
+  el.resultsBody.addEventListener("click", async (e) => {
     const expandBtn = e.target.closest(".cell-expand-btn");
     if (expandBtn) {
       const td = expandBtn.closest("td");
@@ -3304,6 +3957,12 @@ function initEventListeners() {
       return;
     }
 
+    const saveQueryBtn = e.target.closest(".save-query-btn");
+    if (saveQueryBtn) {
+      handleSaveQuery();
+      return;
+    }
+
     const pageBtn = e.target.closest(".page-btn");
     if (pageBtn) {
       goToResultPage(Number(pageBtn.getAttribute("data-idx")), pageBtn.getAttribute("data-dir"));
@@ -3312,7 +3971,7 @@ function initEventListeners() {
 
     const clearHistoryBtn = e.target.closest(".history-clear-btn");
     if (clearHistoryBtn) {
-      if (confirm("Clear all queries from this session's history?")) clearQueryHistory();
+      if (await showConfirmDialog("Clear all queries from this session's history?")) clearQueryHistory();
       return;
     }
 
@@ -3368,6 +4027,11 @@ function initEventListeners() {
     handleExportExcel();
   });
 
+  el.menuSchemaAi.addEventListener("click", () => {
+    setMenuOpen(false);
+    handleCopySchemaForAi();
+  });
+
   el.menuOpenNewTab.addEventListener("click", () => {
     setMenuOpen(false);
     handleOpenInNewTab();
@@ -3383,13 +4047,11 @@ function initEventListeners() {
     applyTheme(current === "dark" ? "light" : "dark");
   });
 
-  el.menuClear.addEventListener("click", () => {
+  el.menuClear.addEventListener("click", async () => {
     setMenuOpen(false);
-    if (confirm("Start a new, empty database? Any unsaved changes will be lost.")) {
-      (async () => {
-        await wipeCurrentDatabaseStore();
-        await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
-      })();
+    if (await showConfirmDialog("Start a new, empty database? Any unsaved changes will be lost.", { danger: true })) {
+      await wipeCurrentDatabaseStore();
+      await switchDatabase(() => createDatabase(), DEFAULT_DB_LABEL, { showLoadingOverlay: false });
     }
   });
 
@@ -3404,11 +4066,22 @@ function initEventListeners() {
     if (file) await handleUpload(file);
   });
 
-  el.refreshTables.addEventListener("click", () => refreshTables());
+  el.refreshTables.addEventListener("click", () => {
+    pendingTablesRefresh = refreshTables();
+  });
 
   el.viewResults.addEventListener("click", () => setResultsView("results"));
   el.viewHistory.addEventListener("click", () => setResultsView("history"));
   el.viewErd.addEventListener("click", () => setResultsView("erd"));
+  el.erdModeSelect.addEventListener("change", () => {
+    erdMode = el.erdModeSelect.value;
+    el.erdClauseSelect.hidden = erdMode !== "sql";
+    if (resultsViewMode === "erd") renderErdView();
+  });
+  el.erdClauseSelect.hidden = erdMode !== "sql";
+  el.erdClauseSelect.addEventListener("change", () => {
+    erdClause = el.erdClauseSelect.value;
+  });
   el.erdZoomIn.addEventListener("click", () => changeErdZoom(ERD_ZOOM_STEP));
   el.erdZoomOut.addEventListener("click", () => changeErdZoom(-ERD_ZOOM_STEP));
   el.erdRefresh.addEventListener("click", () => {
