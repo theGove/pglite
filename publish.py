@@ -14,6 +14,8 @@ from pathlib import Path
 
 import rjsmin
 
+import build as build_module
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -82,7 +84,9 @@ def main():
     if len(sys.argv) != 2:
         print("Usage: python publish.py www.websql.org\n       python publish.py pglite.blogspot.com", file=sys.stderr)
         sys.exit(1)
-    
+
+    build_module.build()
+
     blog_id=None
 
 
